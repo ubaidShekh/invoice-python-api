@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pymongo
 python-dotenv
+python-multipart
+pymupdf
+openpyxl
