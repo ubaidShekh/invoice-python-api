@@ -1,1275 +1,471 @@
-
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from dotenv import load_dotenv
+from datetime import datetime, timezone
+from openpyxl import Workbook
+from io import BytesIO
+from typing import Optional, List
 import os
 import re
 import uuid
-import logging
-from pathlib import Path
-from datetime import datetime, timezone
-from io import BytesIO
-from typing import Optional
+import fitz
+import uvicorn
 
-import pymupdf
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
-from bson import ObjectId
-from bson.errors import InvalidId
-from openpyxl import Workbook
-
-# =========================================================
+# =====================================================
 # CONFIGURATION
-# =========================================================
-
+# =====================================================
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("invoice-api")
-
-MONGODB_URI = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "invoice_delivery")
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
-MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "25"))
-
-if not MONGODB_URI:
-    raise RuntimeError("MONGODB_URI is missing.")
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-client = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=10000
-)
-
-db = client[DB_NAME]
-
-invoices_collection = db["invoices"]
-delivery_collection = db["delivery_items"]
-
-app = FastAPI(
-    title="Invoice & Delivery Management API",
-    version="2.0.0"
-)
+app = FastAPI(title="Invoice Management API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================================================
-# MODELS
-# =========================================================
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI environment variable is missing")
 
+client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000)
+db = client["invoice_delivery"]
+invoices_collection = db["invoices"]
+delivery_collection = db["delivery_items"]
+
+invoices_collection.create_index("invoice_id")
+delivery_collection.create_index("barcode", unique=True)
+delivery_collection.create_index("invoice")
+
+MAX_FILE_SIZE = 25 * 1024 * 1024
+MAX_PAGES = 150
+
+# =====================================================
+# MODELS
+# =====================================================
 class DeliveryItemCreate(BaseModel):
     invoice: str
-    model: Optional[str] = None
-    product_number: Optional[str] = None
-    size: Optional[str] = None
-    quantity: int = Field(default=1, ge=1)
-    barcode: Optional[str] = None
-
+    model: str
+    size: str
+    barcode: str
 
 class BarcodeScan(BaseModel):
     barcode: str
 
-
-class ReviewUpdate(BaseModel):
+class DeliveryItemUpdate(BaseModel):
     invoice: Optional[str] = None
     model: Optional[str] = None
-    product_number: Optional[str] = None
     size: Optional[str] = None
-    quantity: Optional[int] = Field(default=None, ge=1)
 
-
-# =========================================================
-# COMMON HELPERS
-# =========================================================
-
-def now():
+# =====================================================
+# HELPERS
+# =====================================================
+def now_utc():
     return datetime.now(timezone.utc)
 
-
-def clean(value):
-    if value is None:
-        return None
-
-    value = re.sub(r"\s+", " ", str(value)).strip(" \t\r\n:;|")
-
-    if value.lower() in ("", "-", "--", "n/a", "na", "none", "null"):
-        return None
-
-    return value
-
-
 def generate_barcode():
-    return f"INV-{uuid.uuid4().hex[:12].upper()}"
+    return "INV-" + uuid.uuid4().hex[:12].upper()
 
+def clean_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
-def mongo_safe(document):
-    if not document:
-        return None
+# --- NEW EXTRACTION LOGIC ---
+ORDER_NUMBER_RE = re.compile(r"#(\d{7,12})")
+MODEL_RE = re.compile(r"#(\d{2,4})\b")
+PRODUCT_CODE_RE = re.compile(r"\b(\d{8,10})\b")
+SIZE_RE = re.compile(r"^\d{2,3}$|^(XXS|XS|S|M|L|XL|XXL|XXXL)$", re.IGNORECASE)
 
-    document = dict(document)
+def extract_invoices_from_pdf(full_text, filename):
+    matches = list(ORDER_NUMBER_RE.finditer(full_text))
+    if not matches:
+        return [{"invoice_number": os.path.splitext(filename)[0], "text": full_text}]
 
-    if "_id" in document:
-        document["_id"] = str(document["_id"])
+    sections = []
+    seen_numbers = set()
 
-    return document
-
-
-def normalize_header(value):
-    return re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        str(value or "").lower()
-    ).strip()
-
-
-# =========================================================
-# INVOICE NUMBER EXTRACTION
-# =========================================================
-
-INVOICE_PATTERNS = [
-    r"\b(?:invoice|order)\s*(?:number|no\.?|num|#|id)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9/_\-]{2,})",
-    r"\b(?:invoice|order)\s*[:#]\s*([A-Z0-9][A-Z0-9/_\-]{2,})",
-    r"\b(?:bill)\s*(?:number|no\.?)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9/_\-]{2,})",
-]
-
-
-def extract_invoice_number(text, filename, page_number):
-
-    for pattern in INVOICE_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-
-        if match:
-            return clean(match.group(1)), "high"
-
-    # Common order format: #294763905
-    match = re.search(r"#\s*(\d{6,})\b", text)
-
-    if match:
-        return match.group(1), "medium"
-
-    # Do not treat filename as a real invoice number.
-    filename = Path(filename).stem
-
-    return (
-        f"UNKNOWN-{filename}-P{page_number}",
-        "low"
-    )
-
-
-# =========================================================
-# PRODUCT TABLE EXTRACTION
-# =========================================================
-
-HEADER_FIELDS = {
-    "model": {
-        "model",
-        "model no",
-        "model number",
-        "style",
-        "style no",
-        "article",
-        "article no",
-        "item model"
-    },
-
-    "product_number": {
-        "product",
-        "product no",
-        "product number",
-        "sku",
-        "sku no",
-        "item code",
-        "product code",
-        "article code"
-    },
-
-    "size": {
-        "size",
-        "sz",
-        "garment size"
-    },
-
-    "quantity": {
-        "qty",
-        "quantity",
-        "pcs",
-        "units"
-    }
-}
-
-
-def classify_header(value):
-
-    value = normalize_header(value)
-
-    for field, names in HEADER_FIELDS.items():
-
-        if value in names:
-            return field
-
-    if value.startswith("model"):
-        return "model"
-
-    if value.startswith("size") or value == "sz":
-        return "size"
-
-    if value.startswith("qty") or value.startswith("quantity"):
-        return "quantity"
-
-    if value.startswith("sku") or value.startswith("product code"):
-        return "product_number"
-
-    return None
-
-
-def extract_table_products(page):
-
-    products = []
-
-    try:
-        finder = page.find_tables()
-        tables = finder.tables if finder else []
-    except Exception:
-        return products
-
-    for table in tables:
-
-        try:
-            rows = table.extract()
-        except Exception:
+    for index, match in enumerate(matches):
+        invoice_number = match.group(1)
+        if invoice_number in seen_numbers:
             continue
-
-        if not rows:
-            continue
-
-        header_index = None
-        column_map = {}
-
-        for index, row in enumerate(rows[:5]):
-
-            mapping = {}
-
-            for col_index, cell in enumerate(row or []):
-
-                field = classify_header(cell)
-
-                if field and field not in mapping:
-                    mapping[field] = col_index
-
-            if (
-                "size" in mapping
-                and (
-                    "model" in mapping
-                    or "product_number" in mapping
-                )
-            ):
-                header_index = index
-                column_map = mapping
-                break
-
-        if header_index is None:
-            continue
-
-        for row in rows[header_index + 1:]:
-
-            if not row:
-                continue
-
-            joined = " ".join(str(x or "") for x in row).lower()
-
-            if any(
-                word in joined
-                for word in [
-                    "subtotal",
-                    "grand total",
-                    "total amount",
-                    "shipping",
-                    "tax"
-                ]
-            ):
-                continue
-
-            item = {}
-
-            for field, col_index in column_map.items():
-
-                if col_index < len(row):
-
-                    value = clean(row[col_index])
-
-                    if value:
-                        item[field] = value
-
-            if item.get("model") or item.get("product_number"):
-                item.setdefault("quantity", "1")
-                products.append(item)
-
-    return products
-
-
-# =========================================================
-# POSITION-BASED EXTRACTION
-# =========================================================
-
-def extract_position_products(page):
-
-    try:
-        words = page.get_text("words")
-    except Exception:
-        return []
-
-    if not words:
-        return []
-
-    lines = {}
-
-    for word in words:
-
-        x0, y0, x1, y1, token = word[:5]
-
-        key = round(float(y0), 1)
-
-        lines.setdefault(key, []).append(
-            (float(x0), float(x1), str(token))
-        )
-
-    ordered_lines = []
-
-    for y in sorted(lines):
-
-        row_words = sorted(
-            lines[y],
-            key=lambda item: item[0]
-        )
-
-        ordered_lines.append(
-            (y, row_words, " ".join(w[2] for w in row_words))
-        )
-
-    header_index = None
-    columns = {}
-
-    for index, (_, row_words, _) in enumerate(ordered_lines):
-
-        mapping = {}
-
-        for x0, x1, token in row_words:
-
-            field = classify_header(token)
-
-            if field and field not in mapping:
-                mapping[field] = (x0 + x1) / 2
-
-        if (
-            "size" in mapping
-            and (
-                "model" in mapping
-                or "product_number" in mapping
-            )
-        ):
-            header_index = index
-            columns = mapping
-            break
-
-    if header_index is None:
-        return []
-
-    sorted_columns = sorted(
-        (x, field)
-        for field, x in columns.items()
-    )
-
-    boundaries = []
-
-    for index, (x, field) in enumerate(sorted_columns):
-
-        left = (
-            (sorted_columns[index - 1][0] + x) / 2
-            if index else float("-inf")
-        )
-
-        right = (
-            (x + sorted_columns[index + 1][0]) / 2
-            if index + 1 < len(sorted_columns)
-            else float("inf")
-        )
-
-        boundaries.append((left, right, field))
-
-    products = []
-
-    for _, row_words, line_text in ordered_lines[header_index + 1:]:
-
-        lower = line_text.lower()
-
-        if any(
-            word in lower
-            for word in [
-                "subtotal",
-                "grand total",
-                "total amount",
-                "tax amount"
-            ]
-        ):
-            continue
-
-        cells = {field: [] for field in columns}
-
-        for x0, x1, token in row_words:
-
-            center = (x0 + x1) / 2
-
-            for left, right, field in boundaries:
-
-                if left <= center < right:
-                    cells[field].append(token)
-                    break
-
-        item = {
-            field: clean(" ".join(tokens))
-            for field, tokens in cells.items()
-        }
-
-        item = {
-            key: value
-            for key, value in item.items()
-            if value
-        }
-
-        if item.get("model") or item.get("product_number"):
-
-            item.setdefault("quantity", "1")
-            products.append(item)
-
-    return products
-
-
-# =========================================================
-# LABELED TEXT EXTRACTION
-# =========================================================
-
-def extract_labeled_products(text):
-
-    model_pattern = (
-        r"\b(?:model|style|article)\s*"
-        r"(?:no\.?|number|#|code)?\s*[:#\-]?\s*"
-        r"([A-Z0-9][A-Z0-9./_\-]{0,20})"
-    )
-
-    model_matches = list(
-        re.finditer(model_pattern, text, re.IGNORECASE)
-    )
-
-    product_pattern = (
-        r"\b(?:sku|product\s*(?:no\.?|number|code)|item\s*code)"
-        r"\s*[:#\-]?\s*([A-Z0-9][A-Z0-9./_\-]{2,})"
-    )
-
-    product_matches = list(
-        re.finditer(product_pattern, text, re.IGNORECASE)
-    )
-
-    products = []
-
-    for index, match in enumerate(model_matches):
+        seen_numbers.add(invoice_number)
 
         start = match.start()
+        next_match = None
+        for following in matches[index + 1:]:
+            if following.group(1) != invoice_number:
+                next_match = following
+                break
 
-        end = (
-            model_matches[index + 1].start()
-            if index + 1 < len(model_matches)
-            else len(text)
-        )
+        end = next_match.start() if next_match else len(full_text)
+        section_text = full_text[start:end].strip()
 
-        segment = text[start:end]
-
-        item = {
-            "model": clean(match.group(1)),
-            "quantity": "1"
-        }
-
-        size_match = re.search(
-            r"\b(?:size|sz)\s*[:#\-]?\s*"
-            r"([A-Z0-9][A-Z0-9./_\-]{0,10})",
-            segment,
-            re.IGNORECASE
-        )
-
-        product_match = re.search(
-            product_pattern,
-            segment,
-            re.IGNORECASE
-        )
-
-        qty_match = re.search(
-            r"\b(?:qty|quantity)\s*[:#\-]?\s*(\d+)\b",
-            segment,
-            re.IGNORECASE
-        )
-
-        if size_match:
-            item["size"] = clean(size_match.group(1))
-
-        if product_match:
-            item["product_number"] = clean(product_match.group(1))
-
-        if qty_match:
-            item["quantity"] = qty_match.group(1)
-
-        products.append(item)
-
-    if not products and product_matches:
-
-        for match in product_matches:
-
-            products.append({
-                "model": None,
-                "product_number": clean(match.group(1)),
-                "size": None,
-                "quantity": "1"
+        if section_text:
+            sections.append({
+                "invoice_number": invoice_number,
+                "text": section_text
             })
+
+    return sections
+
+def extract_products(section_text):
+    products = []
+    seen = set()
+    lines = section_text.split('\n')
+    
+    for i, line in enumerate(lines):
+        line = clean_text(line)
+        
+        # Find Model (e.g., #230)
+        model_match = MODEL_RE.search(line)
+        if model_match:
+            model = "#" + model_match.group(1)
+            product_code = ""
+            
+            # Product code might be on the same line or nearby
+            code_match = PRODUCT_CODE_RE.search(line)
+            if code_match:
+                product_code = code_match.group(1)
+            else:
+                for j in range(max(0, i-2), min(i+3, len(lines))):
+                    code_match = PRODUCT_CODE_RE.search(clean_text(lines[j]))
+                    if code_match and code_match.group(1) != model_match.group(1):
+                        product_code = code_match.group(1)
+                        break
+
+            # Size extraction: search current and next 5 lines
+            size = "N/A"
+            for j in range(i, min(i + 6, len(lines))):
+                next_line = clean_text(lines[j])
+                # Check if line is just a number (like 54)
+                if SIZE_RE.fullmatch(next_line) and next_line != model_match.group(1) and next_line != product_code:
+                    size = next_line.upper()
+                    break
+                # Check if line contains "Size" or Arabic "المقاس" and a number
+                size_match = re.search(r"(?:size|المقاس)\s*[:]?\s*([0-9]{2,3}|XXS|XS|S|M|L|XL|XXL|XXXL)\b", next_line, re.IGNORECASE)
+                if size_match:
+                    size = size_match.group(1).upper()
+                    break
+
+            key = (model, size, product_code)
+            if key not in seen:
+                seen.add(key)
+                products.append({
+                    "model": model,
+                    "size": size,
+                    "product_code": product_code,
+                    "confidence": 0.95,
+                    "review_required": False
+                })
 
     return products
 
+# --- END NEW EXTRACTION LOGIC ---
 
-# =========================================================
-# EXTRACTION PIPELINE
-# =========================================================
-
-def deduplicate_products(products):
-
-    result = []
-    seen = set()
-
-    for item in products:
-
-        normalized = {
-            "model": clean(item.get("model")),
-            "product_number": clean(item.get("product_number")),
-            "size": clean(item.get("size")),
-            "quantity": clean(item.get("quantity")) or "1"
-        }
-
-        key = tuple(
-            (normalized.get(field) or "").lower()
-            for field in [
-                "model",
-                "product_number",
-                "size",
-                "quantity"
-            ]
-        )
-
-        if (
-            key not in seen
-            and any(
-                normalized.get(field)
-                for field in ["model", "product_number", "size"]
-            )
-        ):
-            seen.add(key)
-            result.append(normalized)
-
-    return result
-
-
-def extract_products(page, text):
-
-    products = extract_table_products(page)
-    method = "table"
-
-    if not products:
-        products = extract_position_products(page)
-        method = "word_positions"
-
-    if not products:
-        products = extract_labeled_products(text)
-        method = "labeled_text"
-
-    return deduplicate_products(products), method
-
-
-# =========================================================
-# VALIDATION
-# =========================================================
-
-def validate_product(product, invoice_number, invoice_confidence):
-
-    missing = []
-
-    if (
-        not invoice_number
-        or invoice_confidence == "low"
-        or invoice_number.startswith("UNKNOWN-")
-    ):
-        missing.append("invoice_number")
-
-    if not product.get("model"):
-        missing.append("model")
-
-    if not product.get("size"):
-        missing.append("size")
-
-    if not product.get("product_number"):
-        missing.append("product_number")
-
-    try:
-        quantity = int(product.get("quantity") or 1)
-
-        if quantity < 1:
-            raise ValueError
-
-    except (TypeError, ValueError):
-        missing.append("quantity")
-
-    return missing, ("high" if not missing else "low")
-
-
-# =========================================================
-# PDF PROCESSING
-# =========================================================
-
-def process_pdf(pdf_path, original_filename):
-
-    created_invoice_ids = []
-    created_item_ids = []
-
-    try:
-        document = pymupdf.open(pdf_path)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid or unreadable PDF: {exc}"
-        )
-
-    try:
-
-        total_pages = len(document)
-
-        if total_pages == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="PDF contains no pages."
-            )
-
-        for page_index, page in enumerate(document):
-
-            page_number = page_index + 1
-
-            text = page.get_text("text") or ""
-
-            invoice_number, invoice_confidence = extract_invoice_number(
-                text,
-                original_filename,
-                page_number
-            )
-
-            products, extraction_method = extract_products(page, text)
-
-            invoice_document = {
-                "invoice_number": invoice_number,
-                "original_filename": original_filename,
-                "stored_file": str(pdf_path),
-                "page_number": page_number,
-                "total_pages": total_pages,
-                "extracted_text": text,
-                "extraction_method": extraction_method,
-                "invoice_confidence": invoice_confidence,
-                "review_required": invoice_confidence == "low",
-                "review_status": (
-                    "Pending"
-                    if invoice_confidence == "low"
-                    else "Not Required"
-                ),
-                "created_at": now()
-            }
-
-            invoice_result = invoices_collection.insert_one(
-                invoice_document
-            )
-
-            invoice_id = str(invoice_result.inserted_id)
-
-            created_invoice_ids.append(invoice_id)
-
-            if not products:
-
-                products = [{
-                    "model": None,
-                    "product_number": None,
-                    "size": None,
-                    "quantity": "1"
-                }]
-
-                extraction_method = "no_product_rows_found"
-
-            for product_index, product in enumerate(products, start=1):
-
-                missing_fields, confidence = validate_product(
-                    product,
-                    invoice_number,
-                    invoice_confidence
-                )
-
-                try:
-                    quantity = max(
-                        1,
-                        int(product.get("quantity") or 1)
-                    )
-                except (TypeError, ValueError):
-                    quantity = 1
-
-                delivery_document = {
-                    "invoice_id": invoice_id,
-
-                    # Existing frontend field preserved.
-                    "invoice": invoice_number,
-                    "invoice_number": invoice_number,
-
-                    "source_filename": original_filename,
-                    "source_page": page_number,
-                    "product_index": product_index,
-
-                    "model": product.get("model"),
-                    "product_number": product.get("product_number"),
-                    "size": product.get("size"),
-                    "quantity": quantity,
-
-                    "barcode": generate_barcode(),
-
-                    "status": "Pending",
-                    "delivered_at": None,
-
-                    "extraction_method": extraction_method,
-                    "confidence": confidence,
-                    "missing_fields": missing_fields,
-
-                    "review_required": bool(missing_fields),
-                    "review_status": (
-                        "Pending"
-                        if missing_fields
-                        else "Not Required"
-                    ),
-
-                    "created_at": now(),
-                    "updated_at": now()
-                }
-
-                result = delivery_collection.insert_one(
-                    delivery_document
-                )
-
-                created_item_ids.append(str(result.inserted_id))
-
-            has_review_items = delivery_collection.find_one({
-                "invoice_id": invoice_id,
-                "review_required": True
-            })
-
-            if has_review_items:
-
-                invoices_collection.update_one(
-                    {"_id": invoice_result.inserted_id},
-                    {
-                        "$set": {
-                            "review_required": True,
-                            "review_status": "Pending"
-                        }
-                    }
-                )
-
-    finally:
-        document.close()
-
-    review_count = delivery_collection.count_documents({
-        "_id": {
-            "$in": [
-                ObjectId(item_id)
-                for item_id in created_item_ids
-            ]
-        },
-        "review_required": True
-    })
-
+def serialize_invoice(document):
     return {
-        "message": "PDF processed successfully.",
-        "filename": original_filename,
-        "total_pages": total_pages,
-        "invoices_created": len(created_invoice_ids),
-        "delivery_items_created": len(created_item_ids),
-        "review_required_count": review_count,
-        "invoice_ids": created_invoice_ids,
-        "delivery_item_ids": created_item_ids
+        "_id": str(document["_id"]),
+        "invoice_id": document.get("invoice_id", ""),
+        "invoice_number": document.get("invoice_number", ""),
+        "filename": document.get("filename", ""),
+        "file_size": document.get("file_size", 0),
+        "total_pages": document.get("total_pages", 0),
+        "extracted_text": document.get("extracted_text", ""),
+        "products": document.get("products", []),
+        "review_required": document.get("review_required", False),
+        "extraction_status": document.get("extraction_status", "completed"),
+        "date": document["created_at"].isoformat() if document.get("created_at") else ""
     }
 
-
-# =========================================================
-# REPORT HELPER
-# =========================================================
+def serialize_delivery_item(item):
+    delivered_at = item.get("delivered_at")
+    return {
+        "_id": str(item["_id"]),
+        "invoice": item.get("invoice", ""),
+        "model": item.get("model", ""),
+        "size": item.get("size", "N/A"),
+        "barcode": item.get("barcode", ""),
+        "status": item.get("status", "Pending"),
+        "delivered_at": delivered_at.isoformat() if delivered_at else None,
+        "date": delivered_at.isoformat() if delivered_at else "-",
+        "created_at": item["created_at"].isoformat() if item.get("created_at") else "",
+        "review_required": item.get("review_required", False),
+        "confidence": item.get("confidence", 0)
+    }
 
 def get_report_items(status="all"):
+    status = status.lower().strip()
+    if status not in ["all", "delivered", "undelivered"]:
+        raise HTTPException(status_code=400, detail="Invalid report status")
 
     query = {}
-
     if status == "delivered":
         query["status"] = "Delivered"
-
     elif status == "undelivered":
-        query["status"] = {"$ne": "Delivered"}
+        query["status"] = "Pending"
 
-    elif status != "all":
-        raise HTTPException(
-            status_code=400,
-            detail="status must be all, delivered or undelivered"
-        )
-
+    items = delivery_collection.find(query).sort("created_at", -1)
     return [
-        mongo_safe(item)
-        for item in delivery_collection.find(query).sort(
-            "created_at", -1
-        )
+        {
+            "id": str(item["_id"]),
+            "invoice": item.get("invoice", ""),
+            "model": item.get("model", ""),
+            "size": item.get("size", "N/A"),
+            "barcode": item.get("barcode", ""),
+            "status": item.get("status", "Pending"),
+            "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
+            "review_required": item.get("review_required", False)
+        }
+        for item in items
     ]
 
-
-# =========================================================
-# BASIC ROUTES
-# =========================================================
-
+# =====================================================
+# ROUTES
+# =====================================================
 @app.get("/")
-def root():
-
-    return {
-        "message": "Invoice & Delivery Management API is running."
-    }
-
+def home():
+    return {"message": "Invoice Management API is running", "status": "healthy"}
 
 @app.get("/health")
 def health():
-
     try:
         client.admin.command("ping")
-
-        return {
-            "status": "ok",
-            "database": "connected"
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=503,
-            detail=f"Database unavailable: {exc}"
-        )
-
-
-# =========================================================
-# PDF UPLOAD
-# =========================================================
+        return {"api": "ok", "mongodb": "connected"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="MongoDB connection failed")
 
 @app.post("/upload_pdf")
-async def upload_pdf(invoice: UploadFile = File(...)):
+async def upload_pdf(invoices: List[UploadFile] = File(...)):
+    if not invoices:
+        raise HTTPException(status_code=400, detail="No files uploaded")
 
-    filename = Path(
-        invoice.filename or "invoice.pdf"
-    ).name
+    all_processed = []
+    total_delivery_items = 0
 
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed."
-        )
+    for invoice in invoices:
+        if not invoice.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"Only PDF files allowed. {invoice.filename} is invalid.")
 
-    content = await invoice.read()
+        pdf_data = await invoice.read(MAX_FILE_SIZE + 1)
+        if not pdf_data or len(pdf_data) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"File {invoice.filename} is empty or too large.")
+        if not pdf_data.startswith(b"%PDF-"):
+            raise HTTPException(status_code=400, detail=f"Invalid PDF file: {invoice.filename}")
 
-    if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded PDF is empty."
-        )
+        invoice_id = str(uuid.uuid4())
+        
+        try:
+            pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+            
+            if pdf_document.needs_pass:
+                pdf_document.close()
+                raise HTTPException(status_code=400, detail=f"Password-protected PDF: {invoice.filename}")
 
-    if len(content) > MAX_PDF_SIZE_MB * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"PDF exceeds {MAX_PDF_SIZE_MB} MB."
-        )
+            total_pages = len(pdf_document)
+            if total_pages == 0 or total_pages > MAX_PAGES:
+                pdf_document.close()
+                raise HTTPException(status_code=400, detail=f"Invalid page count for {invoice.filename}")
 
-    pdf_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.pdf"
+            full_text = "\n".join(page.get_text("text", sort=True) for page in pdf_document)
+            pdf_document.close()
 
-    pdf_path.write_bytes(content)
+            if not full_text.strip():
+                raise HTTPException(status_code=422, detail=f"No text found in {invoice.filename}")
 
-    try:
+            sections = extract_invoices_from_pdf(full_text, invoice.filename)
+            
+            upload_time = now_utc()
+            invoice_documents = []
+            delivery_documents = []
 
-        return process_pdf(pdf_path, filename)
+            for section_index, section in enumerate(sections):
+                products = extract_products(section["text"])
+                invoice_review = len(products) == 0 or any(p["review_required"] for p in products)
 
-    except HTTPException:
-        pdf_path.unlink(missing_ok=True)
-        raise
+                invoice_document = {
+                    "invoice_id": invoice_id,
+                    "invoice_number": section["invoice_number"],
+                    "invoice_sequence": section_index + 1,
+                    "filename": invoice.filename,
+                    "content_type": invoice.content_type,
+                    "file_size": len(pdf_data),
+                    "total_pages": total_pages,
+                    "extracted_text": section["text"],
+                    "products": products,
+                    "product_count": len(products),
+                    "review_required": invoice_review,
+                    "extraction_status": "manual_review" if invoice_review else "completed",
+                    "created_at": upload_time
+                }
+                invoice_documents.append(invoice_document)
 
-    except PyMongoError as exc:
+                for product in products:
+                    delivery_documents.append({
+                        "invoice": section["invoice_number"],
+                        "model": product["model"],
+                        "size": product["size"],
+                        "barcode": generate_barcode(),
+                        "status": "Pending",
+                        "delivered_at": None,
+                        "created_at": upload_time,
+                        "invoice_id": invoice_id,
+                        "review_required": product["review_required"],
+                        "confidence": product["confidence"]
+                    })
 
-        logger.exception("MongoDB processing error")
+            if invoice_documents:
+                invoices_collection.insert_many(invoice_documents)
+            if delivery_documents:
+                delivery_collection.insert_many(delivery_documents)
+                total_delivery_items += len(delivery_documents)
 
-        raise HTTPException(
-            status_code=503,
-            detail=f"Database operation failed: {exc}"
-        )
+            all_processed.append({
+                "filename": invoice.filename,
+                "invoices_created": len(invoice_documents),
+                "products_created": len(delivery_documents)
+            })
 
-    except Exception as exc:
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Error processing {invoice.filename}:", str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to process {invoice.filename}")
 
-        logger.exception("PDF processing error")
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"PDF processing failed: {exc}"
-        )
-
-
-# =========================================================
-# INVOICE APIs
-# =========================================================
+    return {
+        "message": "PDFs processed successfully",
+        "total_files_processed": len(all_processed),
+        "total_delivery_items_created": total_delivery_items,
+        "details": all_processed
+    }
 
 @app.get("/api/invoices")
 def get_invoices():
-
-    return [
-        mongo_safe(item)
-        for item in invoices_collection.find().sort(
-            "created_at", -1
-        )
-    ]
-
-
-@app.get("/api/invoices/{invoice_id}")
-def get_invoice_detail(invoice_id: str):
-
     try:
-        object_id = ObjectId(invoice_id)
-    except InvalidId:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid invoice ID."
-        )
-
-    invoice_document = invoices_collection.find_one({
-        "_id": object_id
-    })
-
-    if not invoice_document:
-        raise HTTPException(
-            status_code=404,
-            detail="Invoice not found."
-        )
-
-    items = [
-        mongo_safe(item)
-        for item in delivery_collection.find({
-            "invoice_id": invoice_id
-        }).sort("product_index", 1)
-    ]
-
-    return {
-        "invoice": mongo_safe(invoice_document),
-        "delivery_items": items
-    }
-
-
-# =========================================================
-# DELIVERY APIs
-# =========================================================
+        invoices = invoices_collection.find().sort("created_at", -1)
+        return [serialize_invoice(inv) for inv in invoices]
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Failed to fetch invoices")
 
 @app.get("/api/delivery-items")
 def get_delivery_items():
-
-    return [
-        mongo_safe(item)
-        for item in delivery_collection.find().sort(
-            "created_at", -1
-        )
-    ]
-
+    try:
+        items = delivery_collection.find().sort("created_at", -1)
+        return [serialize_delivery_item(item) for item in items]
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Failed to fetch delivery items")
 
 @app.post("/api/delivery-items")
-def create_delivery_item(item: DeliveryItemCreate):
-
-    barcode = item.barcode or generate_barcode()
-
+def create_delivery_item_api(item: DeliveryItemCreate):
+    barcode = item.barcode.strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="Barcode is required")
     if delivery_collection.find_one({"barcode": barcode}):
-        raise HTTPException(
-            status_code=409,
-            detail="Barcode already exists."
-        )
+        raise HTTPException(status_code=409, detail="Barcode already exists")
 
-    document = {
-        "invoice": item.invoice,
-        "invoice_number": item.invoice,
-        "model": item.model,
-        "product_number": item.product_number,
-        "size": item.size,
-        "quantity": item.quantity,
+    new_item = {
+        "invoice": item.invoice.strip(),
+        "model": item.model.strip(),
+        "size": item.size.strip(),
         "barcode": barcode,
         "status": "Pending",
         "delivered_at": None,
+        "created_at": now_utc(),
         "review_required": False,
-        "review_status": "Not Required",
-        "created_at": now(),
-        "updated_at": now()
+        "confidence": 1.0
     }
+    result = delivery_collection.insert_one(new_item)
+    return {"message": "Delivery item created", "id": str(result.inserted_id)}
 
-    result = delivery_collection.insert_one(document)
-
-    document["_id"] = str(result.inserted_id)
-
-    return {
-        "message": "Delivery item created.",
-        "item": document
-    }
-
-
-@app.post("/api/delivery-items/scan")
-def scan_barcode(data: BarcodeScan):
-
-    barcode = data.barcode.strip()
-
-    if not barcode:
-        raise HTTPException(
-            status_code=400,
-            detail="Barcode is required."
-        )
-
-    item = delivery_collection.find_one({
-        "barcode": barcode
-    })
-
-    if not item:
-        raise HTTPException(
-            status_code=404,
-            detail="Barcode not found."
-        )
-
-    if item.get("status") == "Delivered":
-
-        return {
-            "message": "Item already delivered.",
-            "item": mongo_safe(item)
-        }
-
-    delivery_collection.update_one(
-        {"_id": item["_id"]},
-        {
-            "$set": {
-                "status": "Delivered",
-                "delivered_at": now(),
-                "updated_at": now()
-            }
-        }
-    )
-
-    updated = delivery_collection.find_one({
-        "_id": item["_id"]
-    })
-
-    return {
-        "message": "Item marked as delivered.",
-        "item": mongo_safe(updated)
-    }
-
-
-# =========================================================
-# REPORT APIs
-# =========================================================
-
-@app.get("/api/reports")
-def get_reports(status: str = "all"):
-
-    return get_report_items(status)
-
-
-@app.get("/api/invoices/export")
-def export_invoices(status: str = "all"):
-
-    items = get_report_items(status)
-
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Delivery Report"
-
-    sheet.append([
-        "Invoice Number",
-        "Model",
-        "Product Number",
-        "Size",
-        "Quantity",
-        "Barcode",
-        "Status",
-        "Delivered At",
-        "Review Required",
-        "Missing Fields",
-        "Source Page"
-    ])
-
-    for item in items:
-
-        delivered_at = item.get("delivered_at")
-
-        if isinstance(delivered_at, datetime):
-            delivered_at = delivered_at.isoformat()
-
-        sheet.append([
-            item.get("invoice_number") or item.get("invoice"),
-            item.get("model"),
-            item.get("product_number"),
-            item.get("size"),
-            item.get("quantity", 1),
-            item.get("barcode"),
-            item.get("status"),
-            delivered_at,
-            item.get("review_required", False),
-            ", ".join(item.get("missing_fields", [])),
-            item.get("source_page")
-        ])
-
-    for column in sheet.columns:
-
-        max_length = max(
-            len(str(cell.value or ""))
-            for cell in column
-        )
-
-        sheet.column_dimensions[
-            column[0].column_letter
-        ].width = min(max_length + 2, 35)
-
-    output = BytesIO()
-
-    workbook.save(output)
-    output.seek(0)
-
-    filename = f"delivery_report_{status}.xlsx"
-
-    return StreamingResponse(
-        output,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="{filename}"'
-            )
-        }
-    )
-
-
-# =========================================================
-# MANUAL REVIEW APIs
-# =========================================================
-
-@app.get("/api/delivery-items/review")
-def get_items_for_review():
-
-    query = {
-        "review_required": True,
-        "review_status": "Pending"
-    }
-
-    return [
-        mongo_safe(item)
-        for item in delivery_collection.find(query).sort(
-            "created_at", -1
-        )
-    ]
-
-
-@app.patch("/api/delivery-items/{item_id}/review")
-def review_delivery_item(
-    item_id: str,
-    update: ReviewUpdate
-):
-
+@app.patch("/api/delivery-items/{item_id}")
+def update_delivery_item(item_id: str, data: DeliveryItemUpdate):
+    from bson import ObjectId
+    from bson.errors import InvalidId
     try:
         object_id = ObjectId(item_id)
     except InvalidId:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid delivery item ID."
-        )
+        raise HTTPException(status_code=400, detail="Invalid ID")
 
-    item = delivery_collection.find_one({
-        "_id": object_id
-    })
+    updates = {}
+    for field in ["invoice", "model", "size"]:
+        value = getattr(data, field)
+        if value is not None:
+            value = value.strip()
+            if not value:
+                raise HTTPException(status_code=400, detail=f"{field} cannot be empty")
+            updates[field] = value
 
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields supplied")
+
+    updates["review_required"] = False
+    updates["reviewed_at"] = now_utc()
+
+    result = delivery_collection.update_one({"_id": object_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"message": "Item updated"}
+
+@app.post("/api/delivery-items/scan")
+def deliver_item(data: BarcodeScan):
+    barcode = data.barcode.strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="Barcode required")
+
+    item = delivery_collection.find_one({"barcode": barcode})
     if not item:
-        raise HTTPException(
-            status_code=404,
-            detail="Delivery item not found."
-        )
+        raise HTTPException(status_code=404, detail="Item not found")
+    if item.get("status") == "Delivered":
+        raise HTTPException(status_code=409, detail="Already delivered")
 
-    changes = update.model_dump(exclude_unset=True)
-
-    merged = {
-        **item,
-        **changes
-    }
-
-    missing = []
-
-    if not merged.get("invoice_number") and not merged.get("invoice"):
-        missing.append("invoice_number")
-
-    if not merged.get("model"):
-        missing.append("model")
-
-    if not merged.get("size"):
-        missing.append("size")
-
-    if not merged.get("product_number"):
-        missing.append("product_number")
-
-    changes["missing_fields"] = missing
-    changes["review_required"] = bool(missing)
-
-    changes["review_status"] = (
-        "Pending" if missing else "Reviewed"
-    )
-
-    changes["updated_at"] = now()
-
+    delivered_at = now_utc()
     delivery_collection.update_one(
-        {"_id": object_id},
-        {"$set": changes}
+        {"_id": item["_id"]},
+        {"$set": {"status": "Delivered", "delivered_at": delivered_at}}
     )
+    return {"message": "Item delivered successfully", "barcode": barcode, "status": "Delivered", "date": delivered_at.isoformat()}
 
-    updated = delivery_collection.find_one({
-        "_id": object_id
-    })
+@app.get("/api/reports")
+def get_reports(status: str = "all"):
+    try:
+        items = get_report_items(status)
+        return {"status": status, "total": len(items), "items": items}
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Failed to fetch reports")
 
-    return {
-        "message": "Review saved.",
-        "item": mongo_safe(updated)
-    }
+@app.get("/api/invoices/export")
+def export_reports(status: str = "all"):
+    try:
+        items = get_report_items(status)
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Delivery Report"
 
+        worksheet.append(["Invoice", "Model", "Size", "Barcode", "Status", "Delivered At", "Manual Review"])
+        for item in items:
+            worksheet.append([
+                item["invoice"], item["model"], item["size"], item["barcode"],
+                item["status"], item["deliveredAt"], "Yes" if item["review_required"] else "No"
+            ])
 
-# =========================================================
-# START SERVER
-# =========================================================
+        for col, width in {"A": 22, "B": 25, "C": 15, "D": 25, "E": 18, "F": 30, "G": 25}.items():
+            worksheet.column_dimensions[col].width = width
+
+        excel_file = BytesIO()
+        workbook.save(excel_file)
+        excel_file.seek(0)
+
+        return StreamingResponse(
+            excel_file,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{status}-report.xlsx"'}
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Excel export failed")
 
 if __name__ == "__main__":
-
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
