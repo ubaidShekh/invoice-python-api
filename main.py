@@ -732,11 +732,10 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
             page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
 
             full_text = f"Inv: #{data['invoice']}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
-
-            font_size = 8
+            font_size = 12  # Bada font (8 se 12)
             fontname = "helv"
-            max_width = page_rect.width - 40
-            while font_size > 5:
+            max_width = page_rect.width * 0.80  # 80% width allowed
+            while font_size > 8:
                 text_width = fitz.get_text_length(full_text, fontname=fontname, fontsize=font_size)
                 if text_width <= max_width:
                     break
