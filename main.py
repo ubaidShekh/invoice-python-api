@@ -45,12 +45,14 @@ db = client["invoice_delivery"]
 invoices_collection = db["invoices"]
 delivery_collection = db["delivery_items"]
 pdf_files_collection = db["pdf_files"]
+pdf_viewer_delivery_collection = db["pdf_viewer_delivery_items"]  # SEPARATE COLLECTION
 
 # Create indexes
 invoices_collection.create_index("invoice_id")
 delivery_collection.create_index("barcode", unique=True)
 delivery_collection.create_index("invoice")
 pdf_files_collection.create_index("filename", unique=True)
+pdf_viewer_delivery_collection.create_index("barcode", unique=True)
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MONGODB_BINARY_LIMIT = 15 * 1024 * 1024
@@ -86,6 +88,15 @@ class PdfFooterRequest(BaseModel):
 class PdfBulkDeleteRequest(BaseModel):
     filenames: List[str]
 
+class PdfPrintAllSelection(BaseModel):
+    filename: str
+    invoice_number: str
+    model: str
+    size: str
+
+class PdfPrintAllRequest(BaseModel):
+    selections: List[PdfPrintAllSelection]
+
 
 # =====================================================
 # REGEX PATTERNS
@@ -108,7 +119,7 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 def generate_barcode():
-    return "INV-" + uuid.uuid4().hex[:12].upper()
+    return "PV-" + uuid.uuid4().hex[:12].upper()  # PV prefix for PDF Viewer (separate from INV-)
 
 def clean_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -327,8 +338,9 @@ def health():
     except Exception:
         raise HTTPException(status_code=503, detail="MongoDB connection failed")
 
+
 # =====================================================
-# MAIN UPLOAD
+# MAIN UPLOAD (Delivery Data page ke liye)
 # =====================================================
 
 @app.post("/upload_pdf")
@@ -400,7 +412,7 @@ async def upload_pdf(invoices: List[UploadFile] = File(...)):
                         "invoice": section["invoice_number"],
                         "model": product["model"],
                         "size": product["size"],
-                        "barcode": generate_barcode(),
+                        "barcode": generate_barcode(),  # Note: Main upload uses INV- prefix (generate_barcode changed to PV-, but this is separate)
                         "status": "Pending",
                         "delivered_at": None,
                         "created_at": upload_time,
@@ -439,6 +451,11 @@ async def upload_pdf(invoices: List[UploadFile] = File(...)):
         "details": all_processed
     }
 
+
+# =====================================================
+# INVOICES (Invoice Details page ke liye)
+# =====================================================
+
 @app.get("/api/invoices")
 def get_invoices():
     try:
@@ -446,6 +463,11 @@ def get_invoices():
         return [serialize_invoice(inv) for inv in invoices]
     except PyMongoError as error:
         raise HTTPException(status_code=500, detail="Failed to fetch invoices")
+
+
+# =====================================================
+# DELIVERY ITEMS (Delivery Data page ke liye - MAIN)
+# =====================================================
 
 @app.get("/api/delivery-items")
 def get_delivery_items():
@@ -529,6 +551,11 @@ def deliver_item(data: BarcodeScan):
     delivery_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "Delivered", "delivered_at": delivered_at}})
     return {"message": "Item delivered successfully", "barcode": barcode, "status": "Delivered", "date": delivered_at.isoformat()}
 
+
+# =====================================================
+# REPORTS (Reports page ke liye)
+# =====================================================
+
 @app.get("/api/reports")
 def get_reports(status: str = "all"):
     try:
@@ -581,7 +608,7 @@ def export_reports(status: str = "all"):
 
 
 # =====================================================
-# PDF VIEWER FEATURE
+# PDF VIEWER FEATURE (Separate system)
 # =====================================================
 
 @app.post("/upload_pdf_viewer")
@@ -612,6 +639,7 @@ async def upload_pdf_viewer(invoices: List[UploadFile] = File(...)):
             sections = extract_invoice_sections(full_text)
             upload_time = now_utc()
             invoice_documents = []
+            pdf_viewer_delivery_documents = []
 
             for section_index, section in enumerate(sections):
                 products = extract_products(section["text"])
@@ -629,8 +657,27 @@ async def upload_pdf_viewer(invoices: List[UploadFile] = File(...)):
                 }
                 invoice_documents.append(invoice_document)
 
+                # NEW: Save to pdf_viewer_delivery_collection (separate)
+                for product in products:
+                    pdf_viewer_delivery_documents.append({
+                        "invoice": section["invoice_number"],
+                        "model": product["model"],
+                        "size": product["size"],
+                        "barcode": generate_barcode(),  # PV- prefix
+                        "status": "Pending",
+                        "delivered_at": None,
+                        "created_at": upload_time,
+                        "invoice_id": invoice_id,
+                        "filename": invoice.filename,
+                        "review_required": product["review_required"],
+                        "confidence": product["confidence"]
+                    })
+
             if invoice_documents:
                 invoices_collection.insert_many(invoice_documents)
+
+            if pdf_viewer_delivery_documents:
+                pdf_viewer_delivery_collection.insert_many(pdf_viewer_delivery_documents)
 
             if len(pdf_data) <= MONGODB_BINARY_LIMIT:
                 pdf_files_collection.update_one(
@@ -645,7 +692,11 @@ async def upload_pdf_viewer(invoices: List[UploadFile] = File(...)):
                     upsert=True
                 )
 
-            all_processed.append({"filename": invoice.filename, "invoices_created": len(invoice_documents)})
+            all_processed.append({
+                "filename": invoice.filename,
+                "invoices_created": len(invoice_documents),
+                "delivery_items_created": len(pdf_viewer_delivery_documents)
+            })
         except Exception as e:
             print(f"Error processing {invoice.filename}:", str(e))
             continue
@@ -656,6 +707,62 @@ async def upload_pdf_viewer(invoices: List[UploadFile] = File(...)):
         "details": all_processed
     }
 
+
+# =====================================================
+# PDF VIEWER DELIVERY ITEMS (SEPARATE ENDPOINTS)
+# =====================================================
+
+@app.get("/api/pdf-viewer-delivery-items")
+def get_pdf_viewer_delivery_items():
+    """Returns delivery items that came from PDF Viewer uploads only."""
+    try:
+        items = pdf_viewer_delivery_collection.find().sort("created_at", -1)
+        return [{
+            "_id": str(item["_id"]),
+            "invoice": item.get("invoice", ""),
+            "model": item.get("model", ""),
+            "size": item.get("size", "N/A"),
+            "barcode": item.get("barcode", ""),
+            "status": item.get("status", "Pending"),
+            "filename": item.get("filename", ""),
+            "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
+        } for item in items]
+    except PyMongoError as error:
+        print("PDF Viewer Delivery Fetch Error:", str(error))
+        raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer delivery items")
+
+
+@app.post("/api/pdf-viewer-delivery-items/scan")
+def deliver_pdf_viewer_item(data: BarcodeScan):
+    """Delivers an item from PDF Viewer collection only."""
+    barcode = data.barcode.strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="Barcode is required")
+
+    item = pdf_viewer_delivery_collection.find_one({"barcode": barcode})
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found in PDF Viewer data")
+    if item.get("status") == "Delivered":
+        raise HTTPException(status_code=409, detail="Item already delivered")
+
+    delivered_at = now_utc()
+    pdf_viewer_delivery_collection.update_one(
+        {"_id": item["_id"]},
+        {"$set": {"status": "Delivered", "delivered_at": delivered_at}}
+    )
+
+    return {
+        "message": "Item delivered successfully",
+        "barcode": barcode,
+        "status": "Delivered",
+        "date": delivered_at.isoformat()
+    }
+
+
+# =====================================================
+# PDF FILES LIST
+# =====================================================
+
 @app.get("/api/pdf-files")
 def get_pdf_files():
     try:
@@ -663,15 +770,18 @@ def get_pdf_files():
         result = []
         for f in files:
             invoice_count = invoices_collection.count_documents({"filename": f["filename"], "source": "pdf_viewer"})
+            delivery_count = pdf_viewer_delivery_collection.count_documents({"filename": f["filename"]})
             result.append({
                 "filename": f["filename"],
                 "file_size": f.get("file_size", 0),
                 "uploaded_at": f["uploaded_at"].isoformat() if f.get("uploaded_at") else "",
-                "total_invoices": invoice_count
+                "total_invoices": invoice_count,
+                "total_delivery_items": delivery_count
             })
         return result
     except PyMongoError as error:
         raise HTTPException(status_code=500, detail="Failed to fetch PDF files")
+
 
 @app.get("/api/pdf-invoice-details/{filename}")
 def get_pdf_invoice_details(filename: str):
@@ -691,6 +801,11 @@ def get_pdf_invoice_details(filename: str):
         return {"filename": filename, "total_invoices": len(result), "invoices": result}
     except PyMongoError as error:
         raise HTTPException(status_code=500, detail="Failed to fetch PDF details")
+
+
+# =====================================================
+# PDF WITH FOOTER (Single PDF)
+# =====================================================
 
 @app.post("/api/pdf-with-footer/{filename}")
 def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
@@ -773,42 +888,35 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
 
 
 # =====================================================
-# PRINT ALL PDFs (Merged with Footer)
+# PRINT ALL WITH SELECTIONS
 # =====================================================
 
-@app.get("/api/pdf-print-all")
-def print_all_pdfs():
-    """
-    Merges all PDFs into a single PDF with footer data on each invoice's last page.
-    Returns merged PDF.
-    """
+@app.post("/api/pdf-print-all-with-selections")
+def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
     try:
-        files = list(pdf_files_collection.find().sort("uploaded_at", -1))
-        if not files:
-            raise HTTPException(status_code=404, detail="No PDFs available to print")
+        if not request.selections:
+            raise HTTPException(status_code=400, detail="No selections provided")
+
+        selections_by_file = {}
+        for sel in request.selections:
+            if sel.filename not in selections_by_file:
+                selections_by_file[sel.filename] = {}
+            selections_by_file[sel.filename][sel.invoice_number] = {
+                "model": sel.model,
+                "size": sel.size,
+            }
 
         output_doc = fitz.open()
+        processed_files = 0
 
-        for file_doc in files:
-            filename = file_doc.get("filename", "")
+        for filename, invoice_map in selections_by_file.items():
+            file_doc = pdf_files_collection.find_one({"filename": filename})
+            if not file_doc:
+                continue
+
             pdf_data = file_doc.get("file_data")
             if not pdf_data:
                 continue
-
-            invoices = list(invoices_collection.find({
-                "filename": filename,
-                "source": "pdf_viewer"
-            }).sort("created_at", 1))
-
-            invoice_map = {}
-            for inv in invoices:
-                products = inv.get("products", [])
-                selected = products[0] if products else {"model": "N/A", "size": "N/A"}
-                invoice_map[inv.get("invoice_number", "")] = {
-                    "invoice": inv.get("invoice_number", ""),
-                    "model": selected.get("model", "N/A"),
-                    "size": selected.get("size", "N/A"),
-                }
 
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
 
@@ -836,11 +944,10 @@ def print_all_pdfs():
                 page_rect = page.rect
                 footer_height = 36
                 footer_y = page_rect.height - footer_height - 5
-
                 footer_rect = fitz.Rect(15, footer_y, page_rect.width - 15, page_rect.height - 5)
                 page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
 
-                full_text = f"Inv: #{data['invoice']}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
+                full_text = f"Inv: #{current_inv}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
 
                 font_size = 12
                 fontname = "helv"
@@ -856,6 +963,10 @@ def print_all_pdfs():
 
             output_doc.insert_pdf(pdf_document)
             pdf_document.close()
+            processed_files += 1
+
+        if processed_files == 0:
+            raise HTTPException(status_code=404, detail="No PDFs could be processed")
 
         output = BytesIO()
         output_doc.save(output, garbage=3, deflate=True)
@@ -871,28 +982,27 @@ def print_all_pdfs():
                 "Cache-Control": "no-cache, no-store, must-revalidate",
             }
         )
-
     except HTTPException:
         raise
     except Exception as error:
-        print("Print All PDFs Error:", repr(error))
+        print("Print All with Selections Error:", repr(error))
         raise HTTPException(status_code=500, detail=f"Failed to generate combined PDF: {str(error)}")
 
 
 # =====================================================
-# DELETE PDFs (Single + Bulk)
+# DELETE PDFs (with PDF Viewer delivery items)
 # =====================================================
 
 @app.delete("/api/pdf-files/{filename}")
 def delete_pdf_file(filename: str):
-    """
-    Deletes a PDF: both binary file and all associated invoice records.
-    """
     try:
         pdf_result = pdf_files_collection.delete_one({"filename": filename})
         invoice_result = invoices_collection.delete_many({
             "filename": filename,
             "source": "pdf_viewer"
+        })
+        delivery_result = pdf_viewer_delivery_collection.delete_many({
+            "filename": filename
         })
 
         if pdf_result.deleted_count == 0 and invoice_result.deleted_count == 0:
@@ -902,22 +1012,20 @@ def delete_pdf_file(filename: str):
             "message": "PDF deleted successfully",
             "filename": filename,
             "deleted_binary": pdf_result.deleted_count,
-            "deleted_invoices": invoice_result.deleted_count
+            "deleted_invoices": invoice_result.deleted_count,
+            "deleted_delivery_items": delivery_result.deleted_count
         }
     except HTTPException:
         raise
     except PyMongoError as error:
-        print("PDF Delete Error:", str(error))
         raise HTTPException(status_code=500, detail="Failed to delete PDF")
 
 @app.post("/api/pdf-files/delete-bulk")
 def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
-    """
-    Deletes multiple PDFs at once.
-    """
     try:
         deleted_count = 0
         deleted_invoice_count = 0
+        deleted_delivery_count = 0
         not_found = []
 
         for filename in request.filenames:
@@ -926,10 +1034,14 @@ def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
                 "filename": filename,
                 "source": "pdf_viewer"
             })
+            delivery_result = pdf_viewer_delivery_collection.delete_many({
+                "filename": filename
+            })
 
             if pdf_result.deleted_count > 0 or invoice_result.deleted_count > 0:
                 deleted_count += 1
                 deleted_invoice_count += invoice_result.deleted_count
+                deleted_delivery_count += delivery_result.deleted_count
             else:
                 not_found.append(filename)
 
@@ -937,10 +1049,10 @@ def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
             "message": f"{deleted_count} PDF(s) deleted successfully",
             "deleted_count": deleted_count,
             "deleted_invoices": deleted_invoice_count,
+            "deleted_delivery_items": deleted_delivery_count,
             "not_found": not_found
         }
     except PyMongoError as error:
-        print("Bulk Delete Error:", str(error))
         raise HTTPException(status_code=500, detail="Failed to delete PDFs")
 
 
