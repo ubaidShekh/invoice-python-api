@@ -83,6 +83,9 @@ class InvoiceSelection(BaseModel):
 class PdfFooterRequest(BaseModel):
     selections: List[InvoiceSelection]
 
+class PdfBulkDeleteRequest(BaseModel):
+    filenames: List[str]
+
 
 # =====================================================
 # REGEX PATTERNS
@@ -324,7 +327,10 @@ def health():
     except Exception:
         raise HTTPException(status_code=503, detail="MongoDB connection failed")
 
-# ----- MAIN UPLOAD -----
+# =====================================================
+# MAIN UPLOAD
+# =====================================================
+
 @app.post("/upload_pdf")
 async def upload_pdf(invoices: List[UploadFile] = File(...)):
     if not invoices:
@@ -726,15 +732,16 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
                 continue
 
             page_rect = page.rect
-            footer_height = 28
+            footer_height = 36
             footer_y = page_rect.height - footer_height - 5
             footer_rect = fitz.Rect(15, footer_y, page_rect.width - 15, page_rect.height - 5)
             page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
 
             full_text = f"Inv: #{data['invoice']}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
-            font_size = 12  # Bada font (8 se 12)
+
+            font_size = 12
             fontname = "helv"
-            max_width = page_rect.width * 0.80  # 80% width allowed
+            max_width = page_rect.width * 0.80
             while font_size > 8:
                 text_width = fitz.get_text_length(full_text, fontname=fontname, fontsize=font_size)
                 if text_width <= max_width:
@@ -763,6 +770,178 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
     except Exception as error:
         print("PDF Footer Generation Error:", repr(error))
         raise HTTPException(status_code=500, detail=f"Failed to generate PDF footer: {str(error)}")
+
+
+# =====================================================
+# PRINT ALL PDFs (Merged with Footer)
+# =====================================================
+
+@app.get("/api/pdf-print-all")
+def print_all_pdfs():
+    """
+    Merges all PDFs into a single PDF with footer data on each invoice's last page.
+    Returns merged PDF.
+    """
+    try:
+        files = list(pdf_files_collection.find().sort("uploaded_at", -1))
+        if not files:
+            raise HTTPException(status_code=404, detail="No PDFs available to print")
+
+        output_doc = fitz.open()
+
+        for file_doc in files:
+            filename = file_doc.get("filename", "")
+            pdf_data = file_doc.get("file_data")
+            if not pdf_data:
+                continue
+
+            invoices = list(invoices_collection.find({
+                "filename": filename,
+                "source": "pdf_viewer"
+            }).sort("created_at", 1))
+
+            invoice_map = {}
+            for inv in invoices:
+                products = inv.get("products", [])
+                selected = products[0] if products else {"model": "N/A", "size": "N/A"}
+                invoice_map[inv.get("invoice_number", "")] = {
+                    "invoice": inv.get("invoice_number", ""),
+                    "model": selected.get("model", "N/A"),
+                    "size": selected.get("size", "N/A"),
+                }
+
+            pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+
+            page_invoices = []
+            for page_num, page in enumerate(pdf_document):
+                page_text = page.get_text("text", sort=True)
+                order_match = re.search(r"#(\d{7,12})", page_text)
+                page_invoices.append(order_match.group(1) if order_match else None)
+
+            invoice_last_page = {}
+            for page_num, inv_num in enumerate(page_invoices):
+                if inv_num:
+                    invoice_last_page[inv_num] = page_num
+
+            for page_num, page in enumerate(pdf_document):
+                current_inv = page_invoices[page_num]
+                if not current_inv:
+                    continue
+                if invoice_last_page.get(current_inv) != page_num:
+                    continue
+                data = invoice_map.get(current_inv)
+                if not data:
+                    continue
+
+                page_rect = page.rect
+                footer_height = 36
+                footer_y = page_rect.height - footer_height - 5
+
+                footer_rect = fitz.Rect(15, footer_y, page_rect.width - 15, page_rect.height - 5)
+                page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
+
+                full_text = f"Inv: #{data['invoice']}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
+
+                font_size = 12
+                fontname = "helv"
+                max_width = page_rect.width * 0.80
+                while font_size > 8:
+                    text_width = fitz.get_text_length(full_text, fontname=fontname, fontsize=font_size)
+                    if text_width <= max_width:
+                        break
+                    font_size -= 0.5
+
+                text_y = footer_y + footer_height / 2 + font_size / 3
+                page.insert_text((20, text_y), full_text, fontsize=font_size, color=(0.1, 0.1, 0.1), fontname=fontname)
+
+            output_doc.insert_pdf(pdf_document)
+            pdf_document.close()
+
+        output = BytesIO()
+        output_doc.save(output, garbage=3, deflate=True)
+        output_doc.close()
+        output.seek(0)
+
+        return Response(
+            content=output.getvalue(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": 'inline; filename="all_invoices_with_footer.pdf"',
+                "Content-Length": str(len(output.getvalue())),
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("Print All PDFs Error:", repr(error))
+        raise HTTPException(status_code=500, detail=f"Failed to generate combined PDF: {str(error)}")
+
+
+# =====================================================
+# DELETE PDFs (Single + Bulk)
+# =====================================================
+
+@app.delete("/api/pdf-files/{filename}")
+def delete_pdf_file(filename: str):
+    """
+    Deletes a PDF: both binary file and all associated invoice records.
+    """
+    try:
+        pdf_result = pdf_files_collection.delete_one({"filename": filename})
+        invoice_result = invoices_collection.delete_many({
+            "filename": filename,
+            "source": "pdf_viewer"
+        })
+
+        if pdf_result.deleted_count == 0 and invoice_result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="PDF not found")
+
+        return {
+            "message": "PDF deleted successfully",
+            "filename": filename,
+            "deleted_binary": pdf_result.deleted_count,
+            "deleted_invoices": invoice_result.deleted_count
+        }
+    except HTTPException:
+        raise
+    except PyMongoError as error:
+        print("PDF Delete Error:", str(error))
+        raise HTTPException(status_code=500, detail="Failed to delete PDF")
+
+@app.post("/api/pdf-files/delete-bulk")
+def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
+    """
+    Deletes multiple PDFs at once.
+    """
+    try:
+        deleted_count = 0
+        deleted_invoice_count = 0
+        not_found = []
+
+        for filename in request.filenames:
+            pdf_result = pdf_files_collection.delete_one({"filename": filename})
+            invoice_result = invoices_collection.delete_many({
+                "filename": filename,
+                "source": "pdf_viewer"
+            })
+
+            if pdf_result.deleted_count > 0 or invoice_result.deleted_count > 0:
+                deleted_count += 1
+                deleted_invoice_count += invoice_result.deleted_count
+            else:
+                not_found.append(filename)
+
+        return {
+            "message": f"{deleted_count} PDF(s) deleted successfully",
+            "deleted_count": deleted_count,
+            "deleted_invoices": deleted_invoice_count,
+            "not_found": not_found
+        }
+    except PyMongoError as error:
+        print("Bulk Delete Error:", str(error))
+        raise HTTPException(status_code=500, detail="Failed to delete PDFs")
 
 
 # =====================================================
