@@ -315,7 +315,9 @@ def get_report_items(status="all"):
     elif status == "undelivered":
         query["status"] = "Pending"
 
+    # LATEST FIRST: Sort by delivered_at in descending order
     items = delivery_collection.find(query).sort("delivered_at", -1)
+    
     return [
         {
             "id": str(item["_id"]),
@@ -332,7 +334,6 @@ def get_report_items(status="all"):
         }
         for item in items
     ]
-# =====================================================
 # ROUTES
 # =====================================================
 
