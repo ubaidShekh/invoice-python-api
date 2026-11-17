@@ -1128,6 +1128,31 @@ def get_pdf_viewer_reports(status: str = "all"):
     except PyMongoError as error:
         raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer reports")
 
+@app.patch("/api/pdf-viewer-delivery-items/{item_id}/report")
+def update_pdf_viewer_report(item_id: str, data: DeliveryReportUpdate):
+    """Update manual fields for PDF viewer items."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    try:
+        object_id = ObjectId(item_id)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Invalid item ID")
+
+    updates = {}
+    for field in ["normal_rate", "shak", "tatriz", "amount"]:
+        value = getattr(data, field)
+        if value is not None:
+            updates[field] = value.strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = pdf_viewer_delivery_collection.update_one({"_id": object_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"message": "Report updated"}
+
+
 
 # =====================================================
 # SERVER
