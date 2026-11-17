@@ -35,34 +35,30 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI environment variable is missing")
 
-client = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=10000,
-    connectTimeoutMS=10000
-)
+client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000)
 
 db = client["invoice_delivery"]
 invoices_collection = db["invoices"]
 delivery_collection = db["delivery_items"]
 pdf_files_collection = db["pdf_files"]
-pdf_viewer_delivery_collection = db["pdf_viewer_delivery_items"]  # SEPARATE COLLECTION
+pdf_viewer_delivery_collection = db["pdf_viewer_delivery_items"]
 
-# Create indexes
+# Indexes
 invoices_collection.create_index("invoice_id")
 delivery_collection.create_index("barcode", unique=True)
 delivery_collection.create_index("invoice")
 pdf_files_collection.create_index("filename", unique=True)
 pdf_viewer_delivery_collection.create_index("barcode", unique=True)
+# NEW: fast lookup by filename+invoice for upsert
+pdf_viewer_delivery_collection.create_index([("filename", 1), ("invoice", 1)])
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MONGODB_BINARY_LIMIT = 15 * 1024 * 1024
 MAX_PAGES = 150
 
-
 # =====================================================
 # MODELS
 # =====================================================
-
 class DeliveryItemCreate(BaseModel):
     invoice: str
     model: str
@@ -97,91 +93,65 @@ class PdfPrintAllSelection(BaseModel):
 class PdfPrintAllRequest(BaseModel):
     selections: List[PdfPrintAllSelection]
 
-
 class DeliveryReportUpdate(BaseModel):
     normal_rate: Optional[str] = None
     shak: Optional[str] = None
     tatriz: Optional[str] = None
     amount: Optional[str] = None
 
-
-
-
 # =====================================================
 # REGEX PATTERNS
 # =====================================================
-
 ORDER_NUMBER_RE = re.compile(r"#(\d{7,12})")
 MODEL_RE = re.compile(r"#(\d{2,4})\b")
 PRODUCT_CODE_RE = re.compile(r"\b(\d{8,10})\b")
-
 PHONE_RE = re.compile(r"(\+966\d{9,10})")
 AMOUNT_RE = re.compile(r"SAR\s*([\d,]+)")
 PAYMENT_METHOD_RE = re.compile(r"(مدى|تاي|تالي|تاني|البطاقة الائتمانية|البطاقة الالتمانية|أس تي سي باي|تابي|متمم)")
 
-
 # =====================================================
 # HELPERS
 # =====================================================
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def generate_barcode():
-    return "PV-" + uuid.uuid4().hex[:12].upper()  # PV prefix for PDF Viewer (separate from INV-)
-
-def clean_text(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+def now_utc(): return datetime.now(timezone.utc)
+def generate_barcode(): return "PV-" + uuid.uuid4().hex[:12].upper()
+def clean_text(value): return re.sub(r"\s+", " ", str(value or "")).strip()
 
 def extract_invoice_sections(full_text):
     matches = list(ORDER_NUMBER_RE.finditer(full_text))
     if not matches:
         return [{"invoice_number": "Unknown", "text": full_text}]
-
     sections = []
     seen_numbers = set()
-
     for index, match in enumerate(matches):
         invoice_number = match.group(1)
-        if invoice_number in seen_numbers:
-            continue
+        if invoice_number in seen_numbers: continue
         seen_numbers.add(invoice_number)
-
         start = match.start()
         next_match = None
         for following in matches[index + 1:]:
             if following.group(1) != invoice_number:
                 next_match = following
                 break
-
         end = next_match.start() if next_match else len(full_text)
         section_text = full_text[start:end].strip()
-
         if section_text:
-            sections.append({
-                "invoice_number": invoice_number,
-                "text": section_text
-            })
-
+            sections.append({"invoice_number": invoice_number, "text": section_text})
     return sections
 
 def extract_products(section_text):
     products = []
     seen = set()
     model_matches = list(MODEL_RE.finditer(section_text))
-    
     for idx, match in enumerate(model_matches):
         model = "#" + match.group(1)
         start_pos = match.start()
         end_pos = model_matches[idx + 1].start() if idx + 1 < len(model_matches) else len(section_text)
         chunk = section_text[start_pos:end_pos]
-        
         product_code = ""
         for code_match in PRODUCT_CODE_RE.finditer(chunk):
             if code_match.group(1) != match.group(1):
                 product_code = code_match.group(1)
                 break
-
         size = "N/A"
         all_numbers = re.findall(r"\b(\d{2,3})\b", chunk)
         for num in all_numbers:
@@ -191,20 +161,12 @@ def extract_products(section_text):
                     if num != match.group(1) and num != product_code and not num.startswith("966"):
                         size = num
                         break
-            except ValueError:
-                continue
-
+            except ValueError: continue
         key = (model, size, product_code)
         if key not in seen:
             seen.add(key)
-            products.append({
-                "model": model,
-                "size": size,
-                "product_code": product_code,
-                "confidence": 0.95,
-                "review_required": False
-            })
-
+            products.append({"model": model, "size": size, "product_code": product_code,
+                             "confidence": 0.95, "review_required": False})
     return products
 
 def extract_customer_info(section_text):
@@ -213,22 +175,14 @@ def extract_customer_info(section_text):
     phone = "Unknown"
     total_amount = "0"
     payment_method = "Unknown"
-
     phone_match = PHONE_RE.search(section_text)
-    if phone_match:
-        phone = phone_match.group(1)
-
+    if phone_match: phone = phone_match.group(1)
     amount_match = AMOUNT_RE.search(section_text)
-    if amount_match:
-        total_amount = amount_match.group(1).replace(",", "")
-
+    if amount_match: total_amount = amount_match.group(1).replace(",", "")
     payment_match = PAYMENT_METHOD_RE.search(section_text)
-    if payment_match:
-        payment_method = clean_text(payment_match.group(1))
-
+    if payment_match: payment_method = clean_text(payment_match.group(1))
     lines = section_text.split('\n')
     arabic_label_variants = ["مصدرة إلى", "مصدرة الى", "مصدرة إىل", "مصدرة الي", "إلى", "الى"]
-    
     for i, line in enumerate(lines):
         cleaned = clean_text(line)
         for label in arabic_label_variants:
@@ -242,11 +196,8 @@ def extract_customer_info(section_text):
                     if next_clean and not any(city in next_clean for city in ["السعودية", "الرياض", "جدة", "الظهران", "المجمعة"]) and len(next_clean) > 2:
                         customer_name = next_clean
                         break
-                if customer_name != "Unknown":
-                    break
-        if customer_name != "Unknown":
-            break
-
+                if customer_name != "Unknown": break
+        if customer_name != "Unknown": break
     if customer_name == "Unknown" and phone != "Unknown":
         for i, line in enumerate(lines):
             if phone in line:
@@ -256,19 +207,17 @@ def extract_customer_info(section_text):
                         customer_name = prev_clean
                         break
                 break
-
     if customer_name == "Unknown":
-        skip_keywords = ["PAID", "SAR", "سمسا", "بواسطة", "مدى", "تاي", "تالي", "تاني", 
-                        "البطاقة", "تفاصيل", "المبلغ", "طريقة", "الدفع", "الكمية", 
-                        "الرقم", "المنتج", "خيارات", "المقاس", "azuriteabaya", "الرقم الضريبي"]
+        skip_keywords = ["PAID", "SAR", "سمسا", "بواسطة", "مدى", "تاي", "تالي", "تاني",
+                         "البطاقة", "تفاصيل", "المبلغ", "طريقة", "الدفع", "الكمية",
+                         "الرقم", "المنتج", "خيارات", "المقاس", "azuriteabaya", "الرقم الضريبي"]
         for line in lines:
             cleaned = clean_text(line)
-            if (re.match(r"^[A-Z][a-zA-Z\s]{3,}$", cleaned) 
+            if (re.match(r"^[A-Z][a-zA-Z\s]{3,}$", cleaned)
                 and not any(kw.lower() in cleaned.lower() for kw in skip_keywords)
                 and cleaned not in ["Unknown", ""]):
                 customer_name = cleaned
                 break
-
     try:
         for i, line in enumerate(lines):
             if any(city in line for city in ["السعودية", "الرياض", "جدة", "الظهران", "المجمعة"]):
@@ -277,17 +226,9 @@ def extract_customer_info(section_text):
                 else:
                     address = clean_text(line)
                 break
-    except Exception:
-        pass
-
-    return {
-        "customer_name": customer_name,
-        "address": address,
-        "phone": phone,
-        "total_amount": total_amount,
-        "payment_method": payment_method,
-        "status": "Paid"
-    }
+    except Exception: pass
+    return {"customer_name": customer_name, "address": address, "phone": phone,
+            "total_amount": total_amount, "payment_method": payment_method, "status": "Paid"}
 
 def serialize_invoice(document):
     return {
@@ -308,38 +249,62 @@ def get_report_items(status="all"):
     status = status.lower().strip()
     if status not in ["all", "delivered", "undelivered"]:
         raise HTTPException(status_code=400, detail="Invalid report status")
-
     query = {}
-    if status == "delivered":
-        query["status"] = "Delivered"
-    elif status == "undelivered":
-        query["status"] = "Pending"
-
-    # LATEST FIRST: Sort by delivered_at in descending order
+    if status == "delivered": query["status"] = "Delivered"
+    elif status == "undelivered": query["status"] = "Pending"
     items = delivery_collection.find(query).sort("delivered_at", -1)
-    
-    return [
-        {
-            "id": str(item["_id"]),
-            "invoice": item.get("invoice", ""),
-            "model": item.get("model", ""),
-            "size": item.get("size", "N/A"),
-            "barcode": item.get("barcode", ""),
-            "status": item.get("status", "Pending"),
-            "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
-            "normal_rate": item.get("normal_rate", ""),
-            "shak": item.get("shak", ""),
-            "tatriz": item.get("tatriz", ""),
-            "amount": item.get("amount", "")
-        }
-        for item in items
-    ]
+    return [{
+        "id": str(item["_id"]), "invoice": item.get("invoice", ""),
+        "model": item.get("model", ""), "size": item.get("size", "N/A"),
+        "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
+        "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
+        "normal_rate": item.get("normal_rate", ""), "shak": item.get("shak", ""),
+        "tatriz": item.get("tatriz", ""), "amount": item.get("amount", "")
+    } for item in items]
+
+# =====================================================
+# NEW HELPER — selected product ko delivery item banaye/update kare
+# =====================================================
+def save_selected_delivery_item(filename, invoice_number, model, size):
+    """
+    Delivery list me sirf SELECTED product ko rakhe.
+    - Agar same invoice ka item pehle se hai (same filename):
+        - Same model+size → kuch nahi karta
+        - Different model+size → update karta hai (barcode reuse)
+    - Agar nahi hai → naya item create karta hai (naya barcode)
+    """
+    existing = pdf_viewer_delivery_collection.find_one({
+        "filename": filename,
+        "invoice": invoice_number
+    })
+    if existing:
+        if existing.get("model") == model and existing.get("size") == size:
+            return  # already same
+        pdf_viewer_delivery_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "model": model,
+                "size": size,
+                "updated_at": now_utc()
+            }}
+        )
+    else:
+        pdf_viewer_delivery_collection.insert_one({
+            "invoice": invoice_number,
+            "model": model,
+            "size": size,
+            "barcode": generate_barcode(),
+            "status": "Pending",
+            "delivered_at": None,
+            "created_at": now_utc(),
+            "filename": filename,
+        })
+
+# =====================================================
 # ROUTES
 # =====================================================
-
 @app.get("/")
-def home():
-    return {"message": "Invoice Management API is running", "status": "healthy"}
+def home(): return {"message": "Invoice Management API is running", "status": "healthy"}
 
 @app.get("/health")
 def health():
@@ -349,103 +314,70 @@ def health():
     except Exception:
         raise HTTPException(status_code=503, detail="MongoDB connection failed")
 
-
-# =====================================================
-# MAIN UPLOAD (Delivery Data page ke liye)
-# =====================================================
-
+# ----- MAIN UPLOAD -----
 @app.post("/upload_pdf")
 async def upload_pdf(invoices: List[UploadFile] = File(...)):
-    if not invoices:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
+    if not invoices: raise HTTPException(status_code=400, detail="No files uploaded")
     all_processed = []
     total_delivery_items = 0
-
     for invoice in invoices:
         if not invoice.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"Only PDF files allowed. {invoice.filename} is invalid.")
-
         pdf_data = await invoice.read(MAX_FILE_SIZE + 1)
         if not pdf_data or len(pdf_data) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail=f"File {invoice.filename} is empty or too large.")
         if not pdf_data.startswith(b"%PDF-"):
             raise HTTPException(status_code=400, detail=f"Invalid PDF file: {invoice.filename}")
-
         invoice_id = str(uuid.uuid4())
         try:
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             if pdf_document.needs_pass:
                 pdf_document.close()
                 raise HTTPException(status_code=400, detail=f"Password-protected PDF: {invoice.filename}")
-
             total_pages = len(pdf_document)
             if total_pages == 0 or total_pages > MAX_PAGES:
                 pdf_document.close()
                 raise HTTPException(status_code=400, detail=f"Invalid page count for {invoice.filename}")
-
             full_text = "\n".join(page.get_text("text", sort=True) for page in pdf_document)
             pdf_document.close()
-
             if not full_text.strip():
                 raise HTTPException(status_code=422, detail=f"No text found in {invoice.filename}")
-
             sections = extract_invoice_sections(full_text)
             upload_time = now_utc()
             invoice_documents = []
             delivery_documents = []
-
             for section_index, section in enumerate(sections):
                 products = extract_products(section["text"])
                 customer_info = extract_customer_info(section["text"])
                 invoice_review = len(products) == 0
-
                 invoice_document = {
-                    "invoice_id": invoice_id,
-                    "invoice_number": section["invoice_number"],
-                    "invoice_sequence": section_index + 1,
-                    "filename": invoice.filename,
-                    "content_type": invoice.content_type,
-                    "file_size": len(pdf_data),
-                    "total_pages": total_pages,
-                    "extracted_text": section["text"],
-                    "products": products,
-                    "product_count": len(products),
-                    "customer_info": customer_info,
-                    "review_required": invoice_review,
+                    "invoice_id": invoice_id, "invoice_number": section["invoice_number"],
+                    "invoice_sequence": section_index + 1, "filename": invoice.filename,
+                    "content_type": invoice.content_type, "file_size": len(pdf_data),
+                    "total_pages": total_pages, "extracted_text": section["text"],
+                    "products": products, "product_count": len(products),
+                    "customer_info": customer_info, "review_required": invoice_review,
                     "extraction_status": "manual_review" if invoice_review else "completed",
                     "created_at": upload_time
                 }
                 invoice_documents.append(invoice_document)
-
                 for product in products:
                     delivery_documents.append({
-                        "invoice": section["invoice_number"],
-                        "model": product["model"],
-                        "size": product["size"],
-                        "barcode": generate_barcode(),  # Note: Main upload uses INV- prefix (generate_barcode changed to PV-, but this is separate)
-                        "status": "Pending",
-                        "delivered_at": None,
-                        "created_at": upload_time,
-                        "invoice_id": invoice_id,
-                        "review_required": product["review_required"],
+                        "invoice": section["invoice_number"], "model": product["model"],
+                        "size": product["size"], "barcode": generate_barcode(),
+                        "status": "Pending", "delivered_at": None, "created_at": upload_time,
+                        "invoice_id": invoice_id, "review_required": product["review_required"],
                         "confidence": product["confidence"]
                     })
-
-            if invoice_documents:
-                invoices_collection.insert_many(invoice_documents)
+            if invoice_documents: invoices_collection.insert_many(invoice_documents)
             if delivery_documents:
                 delivery_collection.insert_many(delivery_documents)
                 total_delivery_items += len(delivery_documents)
-
             all_processed.append({
-                "filename": invoice.filename,
-                "invoices_created": len(invoice_documents),
+                "filename": invoice.filename, "invoices_created": len(invoice_documents),
                 "products_created": len(delivery_documents)
             })
-
-        except HTTPException:
-            raise
+        except HTTPException: raise
         except fitz.FileDataError:
             raise HTTPException(status_code=400, detail=f"The uploaded PDF is damaged or invalid: {invoice.filename}")
         except PyMongoError as error:
@@ -454,67 +386,39 @@ async def upload_pdf(invoices: List[UploadFile] = File(...)):
         except Exception as error:
             print(f"Error processing {invoice.filename}:", repr(error))
             raise HTTPException(status_code=500, detail=f"Failed to process {invoice.filename}")
-
-    return {
-        "message": "PDFs processed successfully",
-        "total_files_processed": len(all_processed),
-        "total_delivery_items_created": total_delivery_items,
-        "details": all_processed
-    }
-
-
-# =====================================================
-# INVOICES (Invoice Details page ke liye)
-# =====================================================
+    return {"message": "PDFs processed successfully", "total_files_processed": len(all_processed),
+            "total_delivery_items_created": total_delivery_items, "details": all_processed}
 
 @app.get("/api/invoices")
 def get_invoices():
     try:
         invoices = invoices_collection.find().sort("created_at", -1)
         return [serialize_invoice(inv) for inv in invoices]
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to fetch invoices")
-
-
-# =====================================================
-# DELIVERY ITEMS (Delivery Data page ke liye - MAIN)
-# =====================================================
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch invoices")
 
 @app.get("/api/delivery-items")
 def get_delivery_items():
     try:
         items = delivery_collection.find().sort("created_at", -1)
         return [{
-            "_id": str(item["_id"]),
-            "invoice": item.get("invoice", ""),
-            "model": item.get("model", ""),
-            "size": item.get("size", "N/A"),
-            "barcode": item.get("barcode", ""),
-            "status": item.get("status", "Pending"),
+            "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
+            "model": item.get("model", ""), "size": item.get("size", "N/A"),
+            "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
             "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
             "review_required": item.get("review_required", False)
         } for item in items]
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to fetch delivery items")
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch delivery items")
 
 @app.post("/api/delivery-items")
 def create_delivery_item_api(item: DeliveryItemCreate):
     barcode = item.barcode.strip()
-    if not barcode:
-        raise HTTPException(status_code=400, detail="Barcode is required")
+    if not barcode: raise HTTPException(status_code=400, detail="Barcode is required")
     if delivery_collection.find_one({"barcode": barcode}):
         raise HTTPException(status_code=409, detail="Barcode already exists")
-
     new_item = {
-        "invoice": item.invoice.strip(),
-        "model": item.model.strip(),
-        "size": item.size.strip(),
-        "barcode": barcode,
-        "status": "Pending",
-        "delivered_at": None,
-        "created_at": now_utc(),
-        "review_required": False,
-        "confidence": 1.0
+        "invoice": item.invoice.strip(), "model": item.model.strip(), "size": item.size.strip(),
+        "barcode": barcode, "status": "Pending", "delivered_at": None,
+        "created_at": now_utc(), "review_required": False, "confidence": 1.0
     }
     result = delivery_collection.insert_one(new_item)
     return {"message": "Delivery item created", "id": str(result.inserted_id)}
@@ -523,59 +427,40 @@ def create_delivery_item_api(item: DeliveryItemCreate):
 def update_delivery_item(item_id: str, data: DeliveryItemUpdate):
     from bson import ObjectId
     from bson.errors import InvalidId
-    try:
-        object_id = ObjectId(item_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Invalid delivery item ID")
-
+    try: object_id = ObjectId(item_id)
+    except InvalidId: raise HTTPException(status_code=400, detail="Invalid delivery item ID")
     updates = {}
     for field in ["invoice", "model", "size"]:
         value = getattr(data, field)
         if value is not None:
             value = value.strip()
-            if not value:
-                raise HTTPException(status_code=400, detail=f"{field} cannot be empty")
+            if not value: raise HTTPException(status_code=400, detail=f"{field} cannot be empty")
             updates[field] = value
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields supplied for update")
-
+    if not updates: raise HTTPException(status_code=400, detail="No fields supplied for update")
     updates["review_required"] = False
     updates["reviewed_at"] = now_utc()
     result = delivery_collection.update_one({"_id": object_id}, {"$set": updates})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Delivery item not found")
+    if result.matched_count == 0: raise HTTPException(status_code=404, detail="Delivery item not found")
     return {"message": "Delivery item updated successfully"}
 
 @app.post("/api/delivery-items/scan")
 def deliver_item(data: BarcodeScan):
     barcode = data.barcode.strip()
-    if not barcode:
-        raise HTTPException(status_code=400, detail="Barcode is required")
+    if not barcode: raise HTTPException(status_code=400, detail="Barcode is required")
     item = delivery_collection.find_one({"barcode": barcode})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    if item.get("status") == "Delivered":
-        raise HTTPException(status_code=409, detail="Item already delivered")
-
+    if not item: raise HTTPException(status_code=404, detail="Item not found")
+    if item.get("status") == "Delivered": raise HTTPException(status_code=409, detail="Item already delivered")
     delivered_at = now_utc()
     delivery_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "Delivered", "delivered_at": delivered_at}})
     return {"message": "Item delivered successfully", "barcode": barcode, "status": "Delivered", "date": delivered_at.isoformat()}
-
-
-# =====================================================
-# REPORTS (Reports page ke liye)
-# =====================================================
 
 @app.get("/api/reports")
 def get_reports(status: str = "all"):
     try:
         items = get_report_items(status)
         return {"status": status, "total": len(items), "items": items}
-    except HTTPException:
-        raise
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to fetch reports")
+    except HTTPException: raise
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch reports")
 
 @app.get("/api/invoices/export")
 def export_reports(status: str = "all"):
@@ -586,193 +471,72 @@ def export_reports(status: str = "all"):
         worksheet.title = "Delivery Report"
         headers = ["Invoice No.", "Model", "Size", "Barcode", "Normal Rate", "Shak", "Tatriz", "Amount", "Delivered"]
         worksheet.append(headers)
-
         green_fill = PatternFill(start_color="28A745", end_color="28A745", fill_type="solid")
         white_font = Font(bold=True, color="FFFFFF")
         for cell in worksheet[1]:
             cell.fill = green_fill
             cell.font = white_font
-
         for item in items:
-            worksheet.append([
-                item["invoice"], item["model"], item["size"], item["barcode"],
-                item["normal_rate"], item["shak"], item["tatriz"], item["amount"], item["status"]
-            ])
-
+            worksheet.append([item["invoice"], item["model"], item["size"], item["barcode"],
+                              item["normal_rate"], item["shak"], item["tatriz"], item["amount"], item["status"]])
         widths = {"A": 15, "B": 10, "C": 10, "D": 35, "E": 15, "F": 15, "G": 15, "H": 15, "I": 15}
-        for col, width in widths.items():
-            worksheet.column_dimensions[col].width = width
-
+        for col, width in widths.items(): worksheet.column_dimensions[col].width = width
         excel_file = BytesIO()
         workbook.save(excel_file)
         excel_file.seek(0)
-
-        return StreamingResponse(
-            excel_file,
+        return StreamingResponse(excel_file,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{status}-report.xlsx"'}
-        )
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=500, detail="Excel export failed")
-
+            headers={"Content-Disposition": f'attachment; filename="{status}-report.xlsx"'})
+    except HTTPException: raise
+    except Exception: raise HTTPException(status_code=500, detail="Excel export failed")
 
 # =====================================================
-# PDF VIEWER FEATURE (Separate system)
+# PDF VIEWER FEATURE (Separate)
 # =====================================================
-
 @app.post("/upload_pdf_viewer")
 async def upload_pdf_viewer(invoices: List[UploadFile] = File(...)):
-    if not invoices:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
+    if not invoices: raise HTTPException(status_code=400, detail="No files uploaded")
     all_processed = []
     for invoice in invoices:
-        if not invoice.filename.lower().endswith(".pdf"):
-            continue
+        if not invoice.filename.lower().endswith(".pdf"): continue
         pdf_data = await invoice.read(MAX_FILE_SIZE + 1)
-        if not pdf_data or len(pdf_data) > MAX_FILE_SIZE:
-            continue
-        if not pdf_data.startswith(b"%PDF-"):
-            continue
-
+        if not pdf_data or len(pdf_data) > MAX_FILE_SIZE: continue
+        if not pdf_data.startswith(b"%PDF-"): continue
         invoice_id = str(uuid.uuid4())
         try:
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             full_text = "\n".join(page.get_text("text", sort=True) for page in pdf_document)
             total_pages = len(pdf_document)
             pdf_document.close()
-
-            if not full_text.strip():
-                continue
-
+            if not full_text.strip(): continue
             sections = extract_invoice_sections(full_text)
             upload_time = now_utc()
             invoice_documents = []
-            pdf_viewer_delivery_documents = []
-
+            # ❌ NO delivery items created here anymore — only invoice data
             for section_index, section in enumerate(sections):
                 products = extract_products(section["text"])
                 invoice_document = {
-                    "invoice_id": invoice_id,
-                    "invoice_number": section["invoice_number"],
-                    "filename": invoice.filename,
-                    "file_size": len(pdf_data),
-                    "total_pages": total_pages,
-                    "extracted_text": section["text"],
-                    "products": products,
-                    "product_count": len(products),
-                    "created_at": upload_time,
-                    "source": "pdf_viewer"
+                    "invoice_id": invoice_id, "invoice_number": section["invoice_number"],
+                    "filename": invoice.filename, "file_size": len(pdf_data),
+                    "total_pages": total_pages, "extracted_text": section["text"],
+                    "products": products, "product_count": len(products),
+                    "created_at": upload_time, "source": "pdf_viewer"
                 }
                 invoice_documents.append(invoice_document)
-
-                # NEW: Save to pdf_viewer_delivery_collection (separate)
-                for product in products:
-                    pdf_viewer_delivery_documents.append({
-                        "invoice": section["invoice_number"],
-                        "model": product["model"],
-                        "size": product["size"],
-                        "barcode": generate_barcode(),  # PV- prefix
-                        "status": "Pending",
-                        "delivered_at": None,
-                        "created_at": upload_time,
-                        "invoice_id": invoice_id,
-                        "filename": invoice.filename,
-                        "review_required": product["review_required"],
-                        "confidence": product["confidence"]
-                    })
-
-            if invoice_documents:
-                invoices_collection.insert_many(invoice_documents)
-
-            if pdf_viewer_delivery_documents:
-                pdf_viewer_delivery_collection.insert_many(pdf_viewer_delivery_documents)
-
+            if invoice_documents: invoices_collection.insert_many(invoice_documents)
             if len(pdf_data) <= MONGODB_BINARY_LIMIT:
                 pdf_files_collection.update_one(
                     {"filename": invoice.filename},
-                    {"$set": {
-                        "filename": invoice.filename,
-                        "content_type": invoice.content_type,
-                        "file_data": pdf_data,
-                        "file_size": len(pdf_data),
-                        "uploaded_at": upload_time
-                    }},
+                    {"$set": {"filename": invoice.filename, "content_type": invoice.content_type,
+                              "file_data": pdf_data, "file_size": len(pdf_data), "uploaded_at": upload_time}},
                     upsert=True
                 )
-
-            all_processed.append({
-                "filename": invoice.filename,
-                "invoices_created": len(invoice_documents),
-                "delivery_items_created": len(pdf_viewer_delivery_documents)
-            })
+            all_processed.append({"filename": invoice.filename, "invoices_created": len(invoice_documents)})
         except Exception as e:
             print(f"Error processing {invoice.filename}:", str(e))
             continue
-
-    return {
-        "message": "Files processed for viewer",
-        "total_files_processed": len(all_processed),
-        "details": all_processed
-    }
-
-
-# =====================================================
-# PDF VIEWER DELIVERY ITEMS (SEPARATE ENDPOINTS)
-# =====================================================
-
-@app.get("/api/pdf-viewer-delivery-items")
-def get_pdf_viewer_delivery_items():
-    """Returns delivery items that came from PDF Viewer uploads only."""
-    try:
-        items = pdf_viewer_delivery_collection.find().sort("created_at", -1)
-        return [{
-            "_id": str(item["_id"]),
-            "invoice": item.get("invoice", ""),
-            "model": item.get("model", ""),
-            "size": item.get("size", "N/A"),
-            "barcode": item.get("barcode", ""),
-            "status": item.get("status", "Pending"),
-            "filename": item.get("filename", ""),
-            "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
-        } for item in items]
-    except PyMongoError as error:
-        print("PDF Viewer Delivery Fetch Error:", str(error))
-        raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer delivery items")
-
-
-@app.post("/api/pdf-viewer-delivery-items/scan")
-def deliver_pdf_viewer_item(data: BarcodeScan):
-    """Delivers an item from PDF Viewer collection only."""
-    barcode = data.barcode.strip()
-    if not barcode:
-        raise HTTPException(status_code=400, detail="Barcode is required")
-
-    item = pdf_viewer_delivery_collection.find_one({"barcode": barcode})
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found in PDF Viewer data")
-    if item.get("status") == "Delivered":
-        raise HTTPException(status_code=409, detail="Item already delivered")
-
-    delivered_at = now_utc()
-    pdf_viewer_delivery_collection.update_one(
-        {"_id": item["_id"]},
-        {"$set": {"status": "Delivered", "delivered_at": delivered_at}}
-    )
-
-    return {
-        "message": "Item delivered successfully",
-        "barcode": barcode,
-        "status": "Delivered",
-        "date": delivered_at.isoformat()
-    }
-
-
-# =====================================================
-# PDF FILES LIST
-# =====================================================
+    return {"message": "Files processed for viewer", "total_files_processed": len(all_processed),
+            "details": all_processed}
 
 @app.get("/api/pdf-files")
 def get_pdf_files():
@@ -783,16 +547,12 @@ def get_pdf_files():
             invoice_count = invoices_collection.count_documents({"filename": f["filename"], "source": "pdf_viewer"})
             delivery_count = pdf_viewer_delivery_collection.count_documents({"filename": f["filename"]})
             result.append({
-                "filename": f["filename"],
-                "file_size": f.get("file_size", 0),
+                "filename": f["filename"], "file_size": f.get("file_size", 0),
                 "uploaded_at": f["uploaded_at"].isoformat() if f.get("uploaded_at") else "",
-                "total_invoices": invoice_count,
-                "total_delivery_items": delivery_count
+                "total_invoices": invoice_count, "total_delivery_items": delivery_count
             })
         return result
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to fetch PDF files")
-
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF files")
 
 @app.get("/api/pdf-invoice-details/{filename}")
 def get_pdf_invoice_details(filename: str):
@@ -802,234 +562,193 @@ def get_pdf_invoice_details(filename: str):
         for inv in invoices:
             products = inv.get("products", [])
             selected_product = products[0] if products else {"model": "N/A", "size": "N/A"}
-            result.append({
-                "_id": str(inv["_id"]),
-                "invoice_number": inv.get("invoice_number", ""),
-                "products": products,
-                "selected_product": selected_product,
-                "name": ""
-            })
+            result.append({"_id": str(inv["_id"]), "invoice_number": inv.get("invoice_number", ""),
+                           "products": products, "selected_product": selected_product, "name": ""})
         return {"filename": filename, "total_invoices": len(result), "invoices": result}
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to fetch PDF details")
-
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF details")
 
 # =====================================================
-# PDF WITH FOOTER (Single PDF)
+# PDF VIEWER DELIVERY ITEMS (SEPARATE)
 # =====================================================
+@app.get("/api/pdf-viewer-delivery-items")
+def get_pdf_viewer_delivery_items():
+    try:
+        items = pdf_viewer_delivery_collection.find().sort("created_at", -1)
+        return [{
+            "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
+            "model": item.get("model", ""), "size": item.get("size", "N/A"),
+            "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
+            "filename": item.get("filename", ""),
+            "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
+        } for item in items]
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer delivery items")
 
+@app.post("/api/pdf-viewer-delivery-items/scan")
+def deliver_pdf_viewer_item(data: BarcodeScan):
+    barcode = data.barcode.strip()
+    if not barcode: raise HTTPException(status_code=400, detail="Barcode is required")
+    item = pdf_viewer_delivery_collection.find_one({"barcode": barcode})
+    if not item: raise HTTPException(status_code=404, detail="Item not found in PDF Viewer data")
+    if item.get("status") == "Delivered": raise HTTPException(status_code=409, detail="Item already delivered")
+    delivered_at = now_utc()
+    pdf_viewer_delivery_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "Delivered", "delivered_at": delivered_at}})
+    return {"message": "Item delivered successfully", "barcode": barcode, "status": "Delivered", "date": delivered_at.isoformat()}
+
+# =====================================================
+# PDF WITH FOOTER (Single) — NOW ALSO SAVES SELECTED DELIVERY ITEMS
+# =====================================================
 @app.post("/api/pdf-with-footer/{filename}")
 def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
     try:
         file_doc = pdf_files_collection.find_one({"filename": filename})
-        if not file_doc:
-            raise HTTPException(status_code=404, detail="PDF not found")
+        if not file_doc: raise HTTPException(status_code=404, detail="PDF not found")
         pdf_data = file_doc.get("file_data")
-        if not pdf_data:
-            raise HTTPException(status_code=500, detail="PDF binary empty")
-
+        if not pdf_data: raise HTTPException(status_code=500, detail="PDF binary empty")
         invoice_map = {}
         for sel in request.selections:
-            invoice_map[sel.invoice_number] = {
-                "invoice": sel.invoice_number, "model": sel.model, "size": sel.size,
-            }
-
+            invoice_map[sel.invoice_number] = {"invoice": sel.invoice_number, "model": sel.model, "size": sel.size}
         pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
-
         page_invoices = []
         for page_num, page in enumerate(pdf_document):
             page_text = page.get_text("text", sort=True)
             order_match = re.search(r"#(\d{7,12})", page_text)
             page_invoices.append(order_match.group(1) if order_match else None)
-
         invoice_last_page = {}
         for page_num, inv_num in enumerate(page_invoices):
-            if inv_num:
-                invoice_last_page[inv_num] = page_num
-
+            if inv_num: invoice_last_page[inv_num] = page_num
         for page_num, page in enumerate(pdf_document):
             current_inv = page_invoices[page_num]
-            if not current_inv:
-                continue
-            if invoice_last_page.get(current_inv) != page_num:
-                continue
+            if not current_inv: continue
+            if invoice_last_page.get(current_inv) != page_num: continue
             data = invoice_map.get(current_inv)
-            if not data:
-                continue
-
+            if not data: continue
             page_rect = page.rect
             footer_height = 36
             footer_y = page_rect.height - footer_height - 5
             footer_rect = fitz.Rect(15, footer_y, page_rect.width - 15, page_rect.height - 5)
             page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
-
             full_text = f"Inv: #{data['invoice']}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
-
             font_size = 12
             fontname = "helv"
             max_width = page_rect.width * 0.80
             while font_size > 8:
                 text_width = fitz.get_text_length(full_text, fontname=fontname, fontsize=font_size)
-                if text_width <= max_width:
-                    break
+                if text_width <= max_width: break
                 font_size -= 0.5
-
             text_y = footer_y + footer_height / 2 + font_size / 3
             page.insert_text((20, text_y), full_text, fontsize=font_size, color=(0.1, 0.1, 0.1), fontname=fontname)
-
         output = BytesIO()
         pdf_document.save(output, garbage=3, deflate=True)
         pdf_document.close()
         output.seek(0)
 
-        return Response(
-            content=output.getvalue(),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f'inline; filename="modified_{filename}"',
-                "Content-Length": str(len(output.getvalue())),
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-            }
-        )
-    except HTTPException:
-        raise
+        # ✅ NEW: Save delivery items for selected products only
+        try:
+            for sel in request.selections:
+                save_selected_delivery_item(filename, sel.invoice_number, sel.model, sel.size)
+        except PyMongoError as e:
+            print("Failed to save delivery items:", str(e))
+            # Don't block PDF response if DB fails
+
+        return Response(content=output.getvalue(), media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="modified_{filename}"',
+                     "Content-Length": str(len(output.getvalue())),
+                     "Cache-Control": "no-cache, no-store, must-revalidate"})
+    except HTTPException: raise
     except Exception as error:
         print("PDF Footer Generation Error:", repr(error))
         raise HTTPException(status_code=500, detail=f"Failed to generate PDF footer: {str(error)}")
 
-
 # =====================================================
-# PRINT ALL WITH SELECTIONS
+# PRINT ALL WITH SELECTIONS — NOW ALSO SAVES SELECTED DELIVERY ITEMS
 # =====================================================
-
 @app.post("/api/pdf-print-all-with-selections")
 def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
     try:
-        if not request.selections:
-            raise HTTPException(status_code=400, detail="No selections provided")
-
+        if not request.selections: raise HTTPException(status_code=400, detail="No selections provided")
         selections_by_file = {}
         for sel in request.selections:
             if sel.filename not in selections_by_file:
                 selections_by_file[sel.filename] = {}
-            selections_by_file[sel.filename][sel.invoice_number] = {
-                "model": sel.model,
-                "size": sel.size,
-            }
-
+            selections_by_file[sel.filename][sel.invoice_number] = {"model": sel.model, "size": sel.size}
         output_doc = fitz.open()
         processed_files = 0
-
         for filename, invoice_map in selections_by_file.items():
             file_doc = pdf_files_collection.find_one({"filename": filename})
-            if not file_doc:
-                continue
-
+            if not file_doc: continue
             pdf_data = file_doc.get("file_data")
-            if not pdf_data:
-                continue
-
+            if not pdf_data: continue
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
-
             page_invoices = []
             for page_num, page in enumerate(pdf_document):
                 page_text = page.get_text("text", sort=True)
                 order_match = re.search(r"#(\d{7,12})", page_text)
                 page_invoices.append(order_match.group(1) if order_match else None)
-
             invoice_last_page = {}
             for page_num, inv_num in enumerate(page_invoices):
-                if inv_num:
-                    invoice_last_page[inv_num] = page_num
-
+                if inv_num: invoice_last_page[inv_num] = page_num
             for page_num, page in enumerate(pdf_document):
                 current_inv = page_invoices[page_num]
-                if not current_inv:
-                    continue
-                if invoice_last_page.get(current_inv) != page_num:
-                    continue
+                if not current_inv: continue
+                if invoice_last_page.get(current_inv) != page_num: continue
                 data = invoice_map.get(current_inv)
-                if not data:
-                    continue
-
+                if not data: continue
                 page_rect = page.rect
                 footer_height = 36
                 footer_y = page_rect.height - footer_height - 5
                 footer_rect = fitz.Rect(15, footer_y, page_rect.width - 15, page_rect.height - 5)
                 page.draw_rect(footer_rect, color=(0.85, 0.85, 0.85), fill=(0.97, 0.97, 0.97), width=0.5)
-
                 full_text = f"Inv: #{current_inv}    |    Model: {data['model']}    |    Size: {data['size']}    |    Name: ________________"
-
                 font_size = 12
                 fontname = "helv"
                 max_width = page_rect.width * 0.80
                 while font_size > 8:
                     text_width = fitz.get_text_length(full_text, fontname=fontname, fontsize=font_size)
-                    if text_width <= max_width:
-                        break
+                    if text_width <= max_width: break
                     font_size -= 0.5
-
                 text_y = footer_y + footer_height / 2 + font_size / 3
                 page.insert_text((20, text_y), full_text, fontsize=font_size, color=(0.1, 0.1, 0.1), fontname=fontname)
-
             output_doc.insert_pdf(pdf_document)
             pdf_document.close()
             processed_files += 1
-
-        if processed_files == 0:
-            raise HTTPException(status_code=404, detail="No PDFs could be processed")
-
+        if processed_files == 0: raise HTTPException(status_code=404, detail="No PDFs could be processed")
         output = BytesIO()
         output_doc.save(output, garbage=3, deflate=True)
         output_doc.close()
         output.seek(0)
 
-        return Response(
-            content=output.getvalue(),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": 'inline; filename="all_invoices_with_footer.pdf"',
-                "Content-Length": str(len(output.getvalue())),
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-            }
-        )
-    except HTTPException:
-        raise
+        # ✅ NEW: Save delivery items for selected products only (per file)
+        try:
+            for sel in request.selections:
+                save_selected_delivery_item(sel.filename, sel.invoice_number, sel.model, sel.size)
+        except PyMongoError as e:
+            print("Failed to save delivery items (print all):", str(e))
+
+        return Response(content=output.getvalue(), media_type="application/pdf",
+            headers={"Content-Disposition": 'inline; filename="all_invoices_with_footer.pdf"',
+                     "Content-Length": str(len(output.getvalue())),
+                     "Cache-Control": "no-cache, no-store, must-revalidate"})
+    except HTTPException: raise
     except Exception as error:
         print("Print All with Selections Error:", repr(error))
         raise HTTPException(status_code=500, detail=f"Failed to generate combined PDF: {str(error)}")
 
-
 # =====================================================
-# DELETE PDFs (with PDF Viewer delivery items)
+# DELETE PDFs
 # =====================================================
-
 @app.delete("/api/pdf-files/{filename}")
 def delete_pdf_file(filename: str):
     try:
         pdf_result = pdf_files_collection.delete_one({"filename": filename})
-        invoice_result = invoices_collection.delete_many({
-            "filename": filename,
-            "source": "pdf_viewer"
-        })
-        delivery_result = pdf_viewer_delivery_collection.delete_many({
-            "filename": filename
-        })
-
+        invoice_result = invoices_collection.delete_many({"filename": filename, "source": "pdf_viewer"})
+        delivery_result = pdf_viewer_delivery_collection.delete_many({"filename": filename})
         if pdf_result.deleted_count == 0 and invoice_result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="PDF not found")
-
-        return {
-            "message": "PDF deleted successfully",
-            "filename": filename,
-            "deleted_binary": pdf_result.deleted_count,
-            "deleted_invoices": invoice_result.deleted_count,
-            "deleted_delivery_items": delivery_result.deleted_count
-        }
-    except HTTPException:
-        raise
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to delete PDF")
+        return {"message": "PDF deleted successfully", "filename": filename,
+                "deleted_binary": pdf_result.deleted_count, "deleted_invoices": invoice_result.deleted_count,
+                "deleted_delivery_items": delivery_result.deleted_count}
+    except HTTPException: raise
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to delete PDF")
 
 @app.post("/api/pdf-files/delete-bulk")
 def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
@@ -1038,125 +757,119 @@ def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
         deleted_invoice_count = 0
         deleted_delivery_count = 0
         not_found = []
-
         for filename in request.filenames:
             pdf_result = pdf_files_collection.delete_one({"filename": filename})
-            invoice_result = invoices_collection.delete_many({
-                "filename": filename,
-                "source": "pdf_viewer"
-            })
-            delivery_result = pdf_viewer_delivery_collection.delete_many({
-                "filename": filename
-            })
-
+            invoice_result = invoices_collection.delete_many({"filename": filename, "source": "pdf_viewer"})
+            delivery_result = pdf_viewer_delivery_collection.delete_many({"filename": filename})
             if pdf_result.deleted_count > 0 or invoice_result.deleted_count > 0:
                 deleted_count += 1
                 deleted_invoice_count += invoice_result.deleted_count
                 deleted_delivery_count += delivery_result.deleted_count
             else:
                 not_found.append(filename)
+        return {"message": f"{deleted_count} PDF(s) deleted successfully", "deleted_count": deleted_count,
+                "deleted_invoices": deleted_invoice_count, "deleted_delivery_items": deleted_delivery_count,
+                "not_found": not_found}
+    except PyMongoError: raise HTTPException(status_code=500, detail="Failed to delete PDFs")
 
-        return {
-            "message": f"{deleted_count} PDF(s) deleted successfully",
-            "deleted_count": deleted_count,
-            "deleted_invoices": deleted_invoice_count,
-            "deleted_delivery_items": deleted_delivery_count,
-            "not_found": not_found
-        }
-    except PyMongoError as error:
-        raise HTTPException(status_code=500, detail="Failed to delete PDFs")
-
-
+# =====================================================
+# REPORT UPDATE (MAIN)
+# =====================================================
 @app.patch("/api/delivery-items/{item_id}/report")
 def update_delivery_report(item_id: str, data: DeliveryReportUpdate):
-    """Update manual report fields for a delivered item."""
     from bson import ObjectId
     from bson.errors import InvalidId
-    try:
-        object_id = ObjectId(item_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Invalid item ID")
-
+    try: object_id = ObjectId(item_id)
+    except InvalidId: raise HTTPException(status_code=400, detail="Invalid item ID")
     updates = {}
     for field in ["normal_rate", "shak", "tatriz", "amount"]:
         value = getattr(data, field)
-        if value is not None:
-            updates[field] = value.strip()
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
+        if value is not None: updates[field] = value.strip()
+    if not updates: raise HTTPException(status_code=400, detail="No fields to update")
     result = delivery_collection.update_one({"_id": object_id}, {"$set": updates})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Item not found")
+    if result.matched_count == 0: raise HTTPException(status_code=404, detail="Item not found")
     return {"message": "Report updated"}
 
-
-
+# =====================================================
+# PDF VIEWER REPORTS (FIXED)
+# =====================================================
 @app.get("/api/pdf-viewer-reports")
 def get_pdf_viewer_reports(status: str = "all"):
     """Returns reports from PDF Viewer delivery collection only."""
     try:
         query = {}
-        if status == "delivered":
-            query["status"] = "Delivered"
-        elif status == "undelivered":
-            query["status"] = "Pending"
+        if status == "delivered": query["status"] = "Delivered"
+        elif status == "undelivered": query["status"] = "Pending"
 
-        items = pdf_viewer_delivery_collection.find(query).sort("delivered_at", -1)
+        items_list = list(pdf_viewer_delivery_collection.find(query))
         
-        return {
-            "status": status,
-            "total": len(list(items)),
-            "items": [
-                {
-                    "id": str(item["_id"]),
-                    "invoice": item.get("invoice", ""),
-                    "model": item.get("model", ""),
-                    "size": item.get("size", "N/A"),
-                    "barcode": item.get("barcode", ""),
-                    "status": item.get("status", "Pending"),
-                    "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
-                    "normal_rate": item.get("normal_rate", ""),
-                    "shak": item.get("shak", ""),
-                    "tatriz": item.get("tatriz", ""),
-                    "amount": item.get("amount", "")
-                }
-                for item in items
-            ]
-        }
+        def get_sort_key(item):
+            dt = item.get("delivered_at")
+            if dt is None: return datetime.min.replace(tzinfo=timezone.utc)
+            return dt
+        
+        items_list.sort(key=get_sort_key, reverse=True)
+
+        result_items = []
+        for item in items_list:
+            delivered_at = item.get("delivered_at")
+            
+            if delivered_at is None:
+                delivered_at_str = "-"
+            elif isinstance(delivered_at, str):
+                delivered_at_str = delivered_at
+            else:
+                delivered_at_str = delivered_at.isoformat()
+            
+            result_items.append({
+                "id": str(item["_id"]), "invoice": item.get("invoice", ""),
+                "model": item.get("model", ""), "size": item.get("size", "N/A"),
+                "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
+                "deliveredAt": delivered_at_str,
+                "normal_rate": item.get("normal_rate", ""), "shak": item.get("shak", ""),
+                "tatriz": item.get("tatriz", ""), "amount": item.get("amount", "")
+            })
+
+        return {"status": status, "total": len(result_items), "items": result_items}
     except PyMongoError as error:
+        print("PDF Viewer Reports Error:", str(error))
         raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer reports")
+    except Exception as error:
+        print("Unexpected Error in Reports:", repr(error))
+        raise HTTPException(status_code=500, detail=f"Error: {str(error)}")
 
 @app.patch("/api/pdf-viewer-delivery-items/{item_id}/report")
 def update_pdf_viewer_report(item_id: str, data: DeliveryReportUpdate):
-    """Update manual fields for PDF viewer items."""
     from bson import ObjectId
     from bson.errors import InvalidId
-    try:
-        object_id = ObjectId(item_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Invalid item ID")
-
+    try: object_id = ObjectId(item_id)
+    except InvalidId: raise HTTPException(status_code=400, detail="Invalid item ID")
     updates = {}
     for field in ["normal_rate", "shak", "tatriz", "amount"]:
         value = getattr(data, field)
-        if value is not None:
-            updates[field] = value.strip()
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
+        if value is not None: updates[field] = value.strip()
+    if not updates: raise HTTPException(status_code=400, detail="No fields to update")
     result = pdf_viewer_delivery_collection.update_one({"_id": object_id}, {"$set": updates})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Item not found")
+    if result.matched_count == 0: raise HTTPException(status_code=404, detail="Item not found")
     return {"message": "Report updated"}
 
-
+# =====================================================
+# MIGRATION — Purane galat delivery items clean karne ke liye (ek baar chalao)
+# =====================================================
+@app.post("/api/admin/migrate-clean-old-delivery-items")
+def migrate_clean_old_delivery_items():
+    """
+    Ek baar chalao. Purane saare pdf_viewer_delivery_items delete karta hai.
+    Phir user jab PDF Viewer me Generate/Print All karega, sirf selected items banenge.
+    """
+    try:
+        result = pdf_viewer_delivery_collection.delete_many({})
+        return {"message": "Old delivery items cleared", "deleted_count": result.deleted_count}
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Migration failed")
 
 # =====================================================
 # SERVER
 # =====================================================
-
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
