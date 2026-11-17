@@ -98,6 +98,15 @@ class PdfPrintAllRequest(BaseModel):
     selections: List[PdfPrintAllSelection]
 
 
+class DeliveryReportUpdate(BaseModel):
+    normal_rate: Optional[str] = None
+    shak: Optional[str] = None
+    tatriz: Optional[str] = None
+    amount: Optional[str] = None
+
+
+
+
 # =====================================================
 # REGEX PATTERNS
 # =====================================================
@@ -306,7 +315,7 @@ def get_report_items(status="all"):
     elif status == "undelivered":
         query["status"] = "Pending"
 
-    items = delivery_collection.find(query).sort("created_at", -1)
+    items = delivery_collection.find(query).sort("delivered_at", -1)
     return [
         {
             "id": str(item["_id"]),
@@ -316,12 +325,13 @@ def get_report_items(status="all"):
             "barcode": item.get("barcode", ""),
             "status": item.get("status", "Pending"),
             "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
-            "normal_rate": "", "shak": "", "tatriz": "", "amount": ""
+            "normal_rate": item.get("normal_rate", ""),
+            "shak": item.get("shak", ""),
+            "tatriz": item.get("tatriz", ""),
+            "amount": item.get("amount", "")
         }
         for item in items
     ]
-
-
 # =====================================================
 # ROUTES
 # =====================================================
@@ -1054,6 +1064,31 @@ def delete_pdf_files_bulk(request: PdfBulkDeleteRequest):
         }
     except PyMongoError as error:
         raise HTTPException(status_code=500, detail="Failed to delete PDFs")
+
+
+@app.patch("/api/delivery-items/{item_id}/report")
+def update_delivery_report(item_id: str, data: DeliveryReportUpdate):
+    """Update manual report fields for a delivered item."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    try:
+        object_id = ObjectId(item_id)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Invalid item ID")
+
+    updates = {}
+    for field in ["normal_rate", "shak", "tatriz", "amount"]:
+        value = getattr(data, field)
+        if value is not None:
+            updates[field] = value.strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = delivery_collection.update_one({"_id": object_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"message": "Report updated"}
 
 
 # =====================================================
