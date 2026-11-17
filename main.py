@@ -1092,6 +1092,43 @@ def update_delivery_report(item_id: str, data: DeliveryReportUpdate):
     return {"message": "Report updated"}
 
 
+
+@app.get("/api/pdf-viewer-reports")
+def get_pdf_viewer_reports(status: str = "all"):
+    """Returns reports from PDF Viewer delivery collection only."""
+    try:
+        query = {}
+        if status == "delivered":
+            query["status"] = "Delivered"
+        elif status == "undelivered":
+            query["status"] = "Pending"
+
+        items = pdf_viewer_delivery_collection.find(query).sort("delivered_at", -1)
+        
+        return {
+            "status": status,
+            "total": len(list(items)),
+            "items": [
+                {
+                    "id": str(item["_id"]),
+                    "invoice": item.get("invoice", ""),
+                    "model": item.get("model", ""),
+                    "size": item.get("size", "N/A"),
+                    "barcode": item.get("barcode", ""),
+                    "status": item.get("status", "Pending"),
+                    "deliveredAt": item["delivered_at"].isoformat() if item.get("delivered_at") else "-",
+                    "normal_rate": item.get("normal_rate", ""),
+                    "shak": item.get("shak", ""),
+                    "tatriz": item.get("tatriz", ""),
+                    "amount": item.get("amount", "")
+                }
+                for item in items
+            ]
+        }
+    except PyMongoError as error:
+        raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer reports")
+
+
 # =====================================================
 # SERVER
 # =====================================================
