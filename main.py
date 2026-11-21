@@ -52,6 +52,7 @@ pdf_files_collection.create_index("filename", unique=True)
 pdf_viewer_delivery_collection.create_index("barcode", unique=True)
 pdf_viewer_delivery_collection.create_index([("filename", 1), ("invoice", 1)])
 pdf_files_collection.create_index("customer_id")
+pdf_viewer_delivery_collection.create_index("customer_id") # NEW Index
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MONGODB_BINARY_LIMIT = 15 * 1024 * 1024
@@ -269,7 +270,7 @@ def get_report_items(status="all"):
         "tatriz": item.get("tatriz", ""), "amount": item.get("amount", "")
     } for item in items]
 
-def save_selected_delivery_item(filename, invoice_number, model, size):
+def save_selected_delivery_item(filename, invoice_number, model, size, customer_id):
     existing = pdf_viewer_delivery_collection.find_one({
         "filename": filename,
         "invoice": invoice_number
@@ -282,6 +283,7 @@ def save_selected_delivery_item(filename, invoice_number, model, size):
             {"$set": {
                 "model": model,
                 "size": size,
+                "customer_id": customer_id, # NEW
                 "updated_at": now_utc()
             }}
         )
@@ -295,6 +297,7 @@ def save_selected_delivery_item(filename, invoice_number, model, size):
             "delivered_at": None,
             "created_at": now_utc(),
             "filename": filename,
+            "customer_id": customer_id, # NEW
         })
 
 # =====================================================
@@ -425,14 +428,24 @@ def get_pdf_invoice_details(filename: str):
 @app.get("/api/pdf-viewer-delivery-items")
 def get_pdf_viewer_delivery_items():
     try:
-        items = pdf_viewer_delivery_collection.find().sort("created_at", -1)
-        return [{
-            "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
-            "model": item.get("model", ""), "size": item.get("size", "N/A"),
-            "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
-            "filename": item.get("filename", ""),
-            "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
-        } for item in items]
+        items = list(pdf_viewer_delivery_collection.find().sort("created_at", -1))
+        # Fetch all customers to map ID -> Name
+        customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
+        
+        result = []
+        for item in items:
+            cust_id = item.get("customer_id")
+            cust_name = customers.get(cust_id, "Unknown Customer")
+            
+            result.append({
+                "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
+                "model": item.get("model", ""), "size": item.get("size", "N/A"),
+                "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
+                "filename": item.get("filename", ""),
+                "customer_name": cust_name, # NEW
+                "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
+            })
+        return result
     except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer delivery items")
 
 @app.post("/api/pdf-viewer-delivery-items/scan")
@@ -453,6 +466,9 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
         if not file_doc: raise HTTPException(status_code=404, detail="PDF not found")
         pdf_data = file_doc.get("file_data")
         if not pdf_data: raise HTTPException(status_code=500, detail="PDF binary empty")
+        
+        customer_id = file_doc.get("customer_id") # NEW
+        
         invoice_map = {}
         for sel in request.selections:
             invoice_map[sel.invoice_number] = {"invoice": sel.invoice_number, "model": sel.model, "size": sel.size}
@@ -492,7 +508,7 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
         output.seek(0)
         try:
             for sel in request.selections:
-                save_selected_delivery_item(filename, sel.invoice_number, sel.model, sel.size)
+                save_selected_delivery_item(filename, sel.invoice_number, sel.model, sel.size, customer_id) # NEW
         except PyMongoError as e:
             print("Failed to save delivery items:", str(e))
         return Response(content=output.getvalue(), media_type="application/pdf",
@@ -520,6 +536,9 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             if not file_doc: continue
             pdf_data = file_doc.get("file_data")
             if not pdf_data: continue
+            
+            customer_id = file_doc.get("customer_id") # NEW
+            
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             page_invoices = []
             for page_num, page in enumerate(pdf_document):
@@ -553,16 +572,19 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             output_doc.insert_pdf(pdf_document)
             pdf_document.close()
             processed_files += 1
+            
+            # Save delivery items for this file
+            try:
+                for inv_num, data in invoice_map.items():
+                    save_selected_delivery_item(filename, inv_num, data["model"], data["size"], customer_id) # NEW
+            except PyMongoError as e:
+                print("Failed to save delivery items:", str(e))
+                
         if processed_files == 0: raise HTTPException(status_code=404, detail="No PDFs could be processed")
         output = BytesIO()
         output_doc.save(output, garbage=3, deflate=True)
         output_doc.close()
         output.seek(0)
-        try:
-            for sel in request.selections:
-                save_selected_delivery_item(sel.filename, sel.invoice_number, sel.model, sel.size)
-        except PyMongoError as e:
-            print("Failed to save delivery items (print all):", str(e))
         return Response(content=output.getvalue(), media_type="application/pdf",
             headers={"Content-Disposition": 'inline; filename="all_invoices_with_footer.pdf"',
                      "Content-Length": str(len(output.getvalue())),
@@ -630,6 +652,10 @@ def get_pdf_viewer_reports(status: str = "all"):
         if status == "delivered": query["status"] = "Delivered"
         elif status == "undelivered": query["status"] = "Pending"
         items_list = list(pdf_viewer_delivery_collection.find(query))
+        
+        # Fetch all customers to map ID -> Name
+        customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
+        
         def get_sort_key(item):
             dt = item.get("delivered_at")
             if dt is None: return datetime.min.replace(tzinfo=timezone.utc)
@@ -641,11 +667,16 @@ def get_pdf_viewer_reports(status: str = "all"):
             if delivered_at is None: delivered_at_str = "-"
             elif isinstance(delivered_at, str): delivered_at_str = delivered_at
             else: delivered_at_str = delivered_at.isoformat()
+            
+            cust_id = item.get("customer_id")
+            cust_name = customers.get(cust_id, "Unknown Customer")
+            
             result_items.append({
                 "id": str(item["_id"]), "invoice": item.get("invoice", ""),
                 "model": item.get("model", ""), "size": item.get("size", "N/A"),
                 "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
                 "deliveredAt": delivered_at_str,
+                "customer_name": cust_name, # NEW
                 "normal_rate": item.get("normal_rate", ""), "shak": item.get("shak", ""),
                 "tatriz": item.get("tatriz", ""), "amount": item.get("amount", "")
             })
