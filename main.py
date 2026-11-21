@@ -75,7 +75,6 @@ class DeliveryItemCreate(BaseModel):
 
 class BarcodeScan(BaseModel):
     barcode: str
-    customer_id: Optional[str] = None  # NEW
 
 class DeliveryItemUpdate(BaseModel):
     invoice: Optional[str] = None
@@ -277,7 +276,7 @@ def save_selected_delivery_item(filename, invoice_number, model, size, customer_
         "invoice": invoice_number
     })
     if existing:
-        if existing.get("model") == model and existing.get("size") == size:
+        if existing.get("model") == model and existing.get("size") == size and existing.get("customer_id") == customer_id:
             return
         pdf_viewer_delivery_collection.update_one(
             {"_id": existing["_id"]},
@@ -360,6 +359,12 @@ async def upload_pdf_viewer(
         if not pdf_data.startswith(b"%PDF-"): continue
         invoice_id = str(uuid.uuid4())
         try:
+            # Check karo ki same filename already exist karta hai ya nahi
+            existing_file = pdf_files_collection.find_one({"filename": invoice.filename})
+            if existing_file:
+                print(f"Skipping duplicate file: {invoice.filename}")
+                continue
+
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             full_text = "\n".join(page.get_text("text", sort=True) for page in pdf_document)
             total_pages = len(pdf_document)
@@ -426,20 +431,17 @@ def get_pdf_invoice_details(filename: str):
         return {"filename": filename, "total_invoices": len(result), "invoices": result}
     except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF details")
 
-# CHANGED: customer_id filter added
 @app.get("/api/pdf-viewer-delivery-items")
-def get_pdf_viewer_delivery_items(customer_id: Optional[str] = None):
+def get_pdf_viewer_delivery_items():
     try:
-        query = {}
-        if customer_id: query["customer_id"] = customer_id
-        items = list(pdf_viewer_delivery_collection.find(query).sort("created_at", -1))
+        items = list(pdf_viewer_delivery_collection.find().sort("created_at", -1))
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
-
+        
         result = []
         for item in items:
             cust_id = item.get("customer_id")
             cust_name = customers.get(cust_id, "Unknown Customer")
-
+            
             result.append({
                 "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
                 "model": item.get("model", ""), "size": item.get("size", "N/A"),
@@ -451,16 +453,12 @@ def get_pdf_viewer_delivery_items(customer_id: Optional[str] = None):
         return result
     except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF viewer delivery items")
 
-# CHANGED: customer scope added to scan
 @app.post("/api/pdf-viewer-delivery-items/scan")
 def deliver_pdf_viewer_item(data: BarcodeScan):
     barcode = data.barcode.strip()
     if not barcode: raise HTTPException(status_code=400, detail="Barcode is required")
-    query = {"barcode": barcode}
-    if data.customer_id:
-        query["customer_id"] = data.customer_id
-    item = pdf_viewer_delivery_collection.find_one(query)
-    if not item: raise HTTPException(status_code=404, detail="Item not found for this customer")
+    item = pdf_viewer_delivery_collection.find_one({"barcode": barcode})
+    if not item: raise HTTPException(status_code=404, detail="Item not found in PDF Viewer data")
     if item.get("status") == "Delivered": raise HTTPException(status_code=409, detail="Item already delivered")
     delivered_at = now_utc()
     pdf_viewer_delivery_collection.update_one({"_id": item["_id"]}, {"$set": {"status": "Delivered", "delivered_at": delivered_at}})
@@ -473,9 +471,9 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
         if not file_doc: raise HTTPException(status_code=404, detail="PDF not found")
         pdf_data = file_doc.get("file_data")
         if not pdf_data: raise HTTPException(status_code=500, detail="PDF binary empty")
-
+        
         customer_id = file_doc.get("customer_id")
-
+        
         invoice_map = {}
         for sel in request.selections:
             invoice_map[sel.invoice_number] = {"invoice": sel.invoice_number, "model": sel.model, "size": sel.size}
@@ -543,9 +541,9 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             if not file_doc: continue
             pdf_data = file_doc.get("file_data")
             if not pdf_data: continue
-
+            
             customer_id = file_doc.get("customer_id")
-
+            
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             page_invoices = []
             for page_num, page in enumerate(pdf_document):
@@ -579,13 +577,13 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             output_doc.insert_pdf(pdf_document)
             pdf_document.close()
             processed_files += 1
-
+            
             try:
                 for inv_num, data in invoice_map.items():
                     save_selected_delivery_item(filename, inv_num, data["model"], data["size"], customer_id)
             except PyMongoError as e:
                 print("Failed to save delivery items:", str(e))
-
+                
         if processed_files == 0: raise HTTPException(status_code=404, detail="No PDFs could be processed")
         output = BytesIO()
         output_doc.save(output, garbage=3, deflate=True)
@@ -651,18 +649,15 @@ def update_delivery_report(item_id: str, data: DeliveryReportUpdate):
     if result.matched_count == 0: raise HTTPException(status_code=404, detail="Item not found")
     return {"message": "Report updated"}
 
-# CHANGED: customer_id filter added
 @app.get("/api/pdf-viewer-reports")
-def get_pdf_viewer_reports(status: str = "all", customer_id: Optional[str] = None):
+def get_pdf_viewer_reports(status: str = "all"):
     try:
         query = {}
         if status == "delivered": query["status"] = "Delivered"
         elif status == "undelivered": query["status"] = "Pending"
-        if customer_id: query["customer_id"] = customer_id
         items_list = list(pdf_viewer_delivery_collection.find(query))
-
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
-
+        
         def get_sort_key(item):
             dt = item.get("delivered_at")
             if dt is None: return datetime.min.replace(tzinfo=timezone.utc)
@@ -674,10 +669,10 @@ def get_pdf_viewer_reports(status: str = "all", customer_id: Optional[str] = Non
             if delivered_at is None: delivered_at_str = "-"
             elif isinstance(delivered_at, str): delivered_at_str = delivered_at
             else: delivered_at_str = delivered_at.isoformat()
-
+            
             cust_id = item.get("customer_id")
             cust_name = customers.get(cust_id, "Unknown Customer")
-
+            
             result_items.append({
                 "id": str(item["_id"]), "invoice": item.get("invoice", ""),
                 "model": item.get("model", ""), "size": item.get("size", "N/A"),
@@ -717,6 +712,41 @@ def migrate_clean_old_delivery_items():
         return {"message": "Old delivery items cleared", "deleted_count": result.deleted_count}
     except PyMongoError:
         raise HTTPException(status_code=500, detail="Migration failed")
+
+# =====================================================
+# NEW: Duplicate Invoices Cleanup Endpoint
+# =====================================================
+@app.post("/api/admin/clean-duplicate-invoices")
+def clean_duplicate_invoices():
+    """Ek hi filename + invoice_number wale duplicate invoices delete karta hai."""
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": {"filename": "$filename", "invoice_number": "$invoice_number"},
+                    "ids": {"$push": "$_id"},
+                    "count": {"$sum": 1}
+                }
+            },
+            {"$match": {"count": {"$gt": 1}}}
+        ]
+        
+        duplicates = list(invoices_collection.aggregate(pipeline))
+        deleted_count = 0
+        
+        for dup in duplicates:
+            ids_to_keep = dup["ids"][0]
+            ids_to_delete = dup["ids"][1:]
+            result = invoices_collection.delete_many({"_id": {"$in": ids_to_delete}})
+            deleted_count += result.deleted_count
+        
+        return {
+            "message": f"Cleaned {deleted_count} duplicate invoices",
+            "duplicate_groups": len(duplicates),
+            "deleted_count": deleted_count
+        }
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
