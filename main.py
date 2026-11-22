@@ -52,7 +52,9 @@ pdf_files_collection.create_index("filename", unique=True)
 pdf_viewer_delivery_collection.create_index("barcode", unique=True)
 pdf_viewer_delivery_collection.create_index([("filename", 1), ("invoice", 1)])
 pdf_files_collection.create_index("customer_id")
+pdf_files_collection.create_index("batch_id")
 pdf_viewer_delivery_collection.create_index("customer_id")
+invoices_collection.create_index("batch_id")
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MONGODB_BINARY_LIMIT = 15 * 1024 * 1024
@@ -352,6 +354,11 @@ async def upload_pdf_viewer(
 ):
     if not invoices: raise HTTPException(status_code=400, detail="No files uploaded")
     all_processed = []
+    # Har upload ko ek naya batch_id milta hai
+    batch_id = str(uuid.uuid4())
+    batch_uploaded_at = now_utc()
+    batch_files_count = 0
+
     for invoice in invoices:
         if not invoice.filename.lower().endswith(".pdf"): continue
         pdf_data = await invoice.read(MAX_FILE_SIZE + 1)
@@ -381,7 +388,9 @@ async def upload_pdf_viewer(
                     "total_pages": total_pages, "extracted_text": section["text"],
                     "products": products, "product_count": len(products),
                     "created_at": upload_time, "source": "pdf_viewer",
-                    "customer_id": customer_id
+                    "customer_id": customer_id,
+                    "batch_id": batch_id,
+                    "batch_uploaded_at": batch_uploaded_at,
                 }
                 invoice_documents.append(invoice_document)
             if invoice_documents: invoices_collection.insert_many(invoice_documents)
@@ -390,30 +399,75 @@ async def upload_pdf_viewer(
                     {"filename": invoice.filename},
                     {"$set": {"filename": invoice.filename, "content_type": invoice.content_type,
                               "file_data": pdf_data, "file_size": len(pdf_data),
-                              "uploaded_at": upload_time, "customer_id": customer_id}},
+                              "uploaded_at": upload_time, "customer_id": customer_id,
+                              "batch_id": batch_id,
+                              "batch_uploaded_at": batch_uploaded_at}},
                     upsert=True
                 )
             all_processed.append({"filename": invoice.filename, "invoices_created": len(invoice_documents)})
+            batch_files_count += 1
         except Exception as e:
             print(f"Error processing {invoice.filename}:", str(e))
             continue
     return {"message": "Files processed for viewer", "total_files_processed": len(all_processed),
+            "batch_id": batch_id, "batch_files_count": batch_files_count,
             "details": all_processed}
 
+@app.get("/api/pdf-batches")
+def get_pdf_batches(customer_id: Optional[str] = None):
+    """Har upload batch ki summary return karta hai"""
+    try:
+        match_stage = {}
+        if customer_id:
+            match_stage["customer_id"] = customer_id
+
+        pipeline = [
+            {"$match": match_stage},
+            {"$match": {"batch_id": {"$exists": True, "$ne": None}}},
+            {"$group": {
+                "_id": "$batch_id",
+                "customer_id": {"$first": "$customer_id"},
+                "batch_uploaded_at": {"$first": "$batch_uploaded_at"},
+                "pdf_count": {"$sum": 1},
+                "total_size": {"$sum": "$file_size"},
+                "filenames": {"$addToSet": "$filename"},
+            }},
+            {"$sort": {"batch_uploaded_at": -1}}
+        ]
+        batches = list(pdf_files_collection.aggregate(pipeline))
+        result = []
+        for b in batches:
+            uploaded = b.get("batch_uploaded_at")
+            result.append({
+                "batch_id": b["_id"],
+                "customer_id": b.get("customer_id", ""),
+                "uploaded_at": uploaded.isoformat() if uploaded else "",
+                "pdf_count": b.get("pdf_count", 0),
+                "total_size": b.get("total_size", 0),
+                "filenames": b.get("filenames", []),
+            })
+        return result
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Failed to fetch PDF batches")
+
 @app.get("/api/pdf-files")
-def get_pdf_files(customer_id: Optional[str] = None):
+def get_pdf_files(customer_id: Optional[str] = None, batch_id: Optional[str] = None):
     try:
         query = {}
         if customer_id: query["customer_id"] = customer_id
+        if batch_id: query["batch_id"] = batch_id
         files = pdf_files_collection.find(query).sort("uploaded_at", -1)
         result = []
         for f in files:
             invoice_count = invoices_collection.count_documents({"filename": f["filename"], "source": "pdf_viewer"})
             delivery_count = pdf_viewer_delivery_collection.count_documents({"filename": f["filename"]})
+            batch_uploaded = f.get("batch_uploaded_at")
             result.append({
                 "filename": f["filename"], "file_size": f.get("file_size", 0),
                 "uploaded_at": f["uploaded_at"].isoformat() if f.get("uploaded_at") else "",
-                "total_invoices": invoice_count, "total_delivery_items": delivery_count
+                "total_invoices": invoice_count, "total_delivery_items": delivery_count,
+                "batch_id": f.get("batch_id", ""),
+                "batch_uploaded_at": batch_uploaded.isoformat() if batch_uploaded else "",
             })
         return result
     except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF files")
@@ -436,12 +490,12 @@ def get_pdf_viewer_delivery_items():
     try:
         items = list(pdf_viewer_delivery_collection.find().sort("created_at", -1))
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
-        
+
         result = []
         for item in items:
             cust_id = item.get("customer_id")
             cust_name = customers.get(cust_id, "Unknown Customer")
-            
+
             result.append({
                 "_id": str(item["_id"]), "invoice": item.get("invoice", ""),
                 "model": item.get("model", ""), "size": item.get("size", "N/A"),
@@ -471,9 +525,9 @@ def get_pdf_with_footer(filename: str, request: PdfFooterRequest):
         if not file_doc: raise HTTPException(status_code=404, detail="PDF not found")
         pdf_data = file_doc.get("file_data")
         if not pdf_data: raise HTTPException(status_code=500, detail="PDF binary empty")
-        
+
         customer_id = file_doc.get("customer_id")
-        
+
         invoice_map = {}
         for sel in request.selections:
             invoice_map[sel.invoice_number] = {"invoice": sel.invoice_number, "model": sel.model, "size": sel.size}
@@ -541,9 +595,9 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             if not file_doc: continue
             pdf_data = file_doc.get("file_data")
             if not pdf_data: continue
-            
+
             customer_id = file_doc.get("customer_id")
-            
+
             pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
             page_invoices = []
             for page_num, page in enumerate(pdf_document):
@@ -577,13 +631,13 @@ def print_all_pdfs_with_selections(request: PdfPrintAllRequest):
             output_doc.insert_pdf(pdf_document)
             pdf_document.close()
             processed_files += 1
-            
+
             try:
                 for inv_num, data in invoice_map.items():
                     save_selected_delivery_item(filename, inv_num, data["model"], data["size"], customer_id)
             except PyMongoError as e:
                 print("Failed to save delivery items:", str(e))
-                
+
         if processed_files == 0: raise HTTPException(status_code=404, detail="No PDFs could be processed")
         output = BytesIO()
         output_doc.save(output, garbage=3, deflate=True)
@@ -657,7 +711,7 @@ def get_pdf_viewer_reports(status: str = "all"):
         elif status == "undelivered": query["status"] = "Pending"
         items_list = list(pdf_viewer_delivery_collection.find(query))
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
-        
+
         def get_sort_key(item):
             dt = item.get("delivered_at")
             if dt is None: return datetime.min.replace(tzinfo=timezone.utc)
@@ -669,10 +723,10 @@ def get_pdf_viewer_reports(status: str = "all"):
             if delivered_at is None: delivered_at_str = "-"
             elif isinstance(delivered_at, str): delivered_at_str = delivered_at
             else: delivered_at_str = delivered_at.isoformat()
-            
+
             cust_id = item.get("customer_id")
             cust_name = customers.get(cust_id, "Unknown Customer")
-            
+
             result_items.append({
                 "id": str(item["_id"]), "invoice": item.get("invoice", ""),
                 "model": item.get("model", ""), "size": item.get("size", "N/A"),
@@ -714,7 +768,7 @@ def migrate_clean_old_delivery_items():
         raise HTTPException(status_code=500, detail="Migration failed")
 
 # =====================================================
-# NEW: Duplicate Invoices Cleanup Endpoint
+# Duplicate Invoices Cleanup Endpoint
 # =====================================================
 @app.post("/api/admin/clean-duplicate-invoices")
 def clean_duplicate_invoices():
@@ -730,16 +784,16 @@ def clean_duplicate_invoices():
             },
             {"$match": {"count": {"$gt": 1}}}
         ]
-        
+
         duplicates = list(invoices_collection.aggregate(pipeline))
         deleted_count = 0
-        
+
         for dup in duplicates:
             ids_to_keep = dup["ids"][0]
             ids_to_delete = dup["ids"][1:]
             result = invoices_collection.delete_many({"_id": {"$in": ids_to_delete}})
             deleted_count += result.deleted_count
-        
+
         return {
             "message": f"Cleaned {deleted_count} duplicate invoices",
             "duplicate_groups": len(duplicates),
@@ -747,6 +801,29 @@ def clean_duplicate_invoices():
         }
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+# =====================================================
+# NEW: Migrate Old PDFs to Legacy Batch
+# =====================================================
+@app.post("/api/admin/migrate-add-batch-ids")
+def migrate_add_batch_ids():
+    """Purane PDFs ko ek 'legacy' batch assign karta hai."""
+    try:
+        old_files = list(pdf_files_collection.find({"batch_id": {"$exists": False}}))
+        legacy_batch = str(uuid.uuid4())
+        for f in old_files:
+            uploaded = f.get("uploaded_at", now_utc())
+            pdf_files_collection.update_one(
+                {"_id": f["_id"]},
+                {"$set": {"batch_id": legacy_batch, "batch_uploaded_at": uploaded}}
+            )
+        invoices_collection.update_many(
+            {"batch_id": {"$exists": False}},
+            [{"$set": {"batch_id": legacy_batch, "batch_uploaded_at": "$created_at"}}]
+        )
+        return {"message": f"Migrated {len(old_files)} old PDFs to legacy batch", "legacy_batch_id": legacy_batch}
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
