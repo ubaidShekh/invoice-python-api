@@ -53,6 +53,7 @@ pdf_viewer_delivery_collection.create_index("barcode", unique=True)
 pdf_viewer_delivery_collection.create_index([("filename", 1), ("invoice", 1)])
 pdf_files_collection.create_index("customer_id")
 pdf_viewer_delivery_collection.create_index("customer_id")
+pdf_files_collection.create_index("batch_id") # NEW
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MONGODB_BINARY_LIMIT = 15 * 1024 * 1024
@@ -276,7 +277,7 @@ def save_selected_delivery_item(filename, invoice_number, model, size, customer_
         "invoice": invoice_number
     })
     if existing:
-        if existing.get("model") == model and existing.get("size") == size and existing.get("customer_id") == customer_id:
+        if existing.get("model") == model and existing.get("size") == size:
             return
         pdf_viewer_delivery_collection.update_one(
             {"_id": existing["_id"]},
@@ -351,6 +352,11 @@ async def upload_pdf_viewer(
     customer_id: str = Form(...)
 ):
     if not invoices: raise HTTPException(status_code=400, detail="No files uploaded")
+    
+    # Generate a unique batch ID for this upload session
+    batch_id = str(uuid.uuid4())
+    upload_time = now_utc()
+    
     all_processed = []
     for invoice in invoices:
         if not invoice.filename.lower().endswith(".pdf"): continue
@@ -371,7 +377,7 @@ async def upload_pdf_viewer(
             pdf_document.close()
             if not full_text.strip(): continue
             sections = extract_invoice_sections(full_text)
-            upload_time = now_utc()
+            
             invoice_documents = []
             for section_index, section in enumerate(sections):
                 products = extract_products(section["text"])
@@ -381,7 +387,8 @@ async def upload_pdf_viewer(
                     "total_pages": total_pages, "extracted_text": section["text"],
                     "products": products, "product_count": len(products),
                     "created_at": upload_time, "source": "pdf_viewer",
-                    "customer_id": customer_id
+                    "customer_id": customer_id,
+                    "batch_id": batch_id  # NEW
                 }
                 invoice_documents.append(invoice_document)
             if invoice_documents: invoices_collection.insert_many(invoice_documents)
@@ -390,21 +397,51 @@ async def upload_pdf_viewer(
                     {"filename": invoice.filename},
                     {"$set": {"filename": invoice.filename, "content_type": invoice.content_type,
                               "file_data": pdf_data, "file_size": len(pdf_data),
-                              "uploaded_at": upload_time, "customer_id": customer_id}},
+                              "uploaded_at": upload_time, "customer_id": customer_id,
+                              "batch_id": batch_id}},  # NEW
                     upsert=True
                 )
             all_processed.append({"filename": invoice.filename, "invoices_created": len(invoice_documents)})
         except Exception as e:
             print(f"Error processing {invoice.filename}:", str(e))
             continue
-    return {"message": "Files processed for viewer", "total_files_processed": len(all_processed),
+    return {"message": "Files processed for viewer", "batch_id": batch_id, "total_files_processed": len(all_processed),
             "details": all_processed}
 
+# NEW: Get PDF batches for a customer
+@app.get("/api/pdf-batches")
+def get_pdf_batches(customer_id: str):
+    try:
+        pipeline = [
+            {"$match": {"customer_id": customer_id}},
+            {"$group": {
+                "_id": "$batch_id",
+                "total_files": {"$sum": 1},
+                "total_size": {"$sum": "$file_size"},
+                "uploaded_at": {"$max": "$uploaded_at"}
+            }},
+            {"$sort": {"uploaded_at": -1}}
+        ]
+        batches = list(pdf_files_collection.aggregate(pipeline))
+        
+        result = []
+        for b in batches:
+            result.append({
+                "batch_id": b["_id"],
+                "total_files": b["total_files"],
+                "total_size": b["total_size"],
+                "uploaded_at": b["uploaded_at"].isoformat() if b.get("uploaded_at") else ""
+            })
+        return result
+    except PyMongoError:
+        raise HTTPException(status_code=500, detail="Failed to fetch batches")
+
 @app.get("/api/pdf-files")
-def get_pdf_files(customer_id: Optional[str] = None):
+def get_pdf_files(customer_id: Optional[str] = None, batch_id: Optional[str] = None):
     try:
         query = {}
         if customer_id: query["customer_id"] = customer_id
+        if batch_id: query["batch_id"] = batch_id  # NEW
         files = pdf_files_collection.find(query).sort("uploaded_at", -1)
         result = []
         for f in files:
