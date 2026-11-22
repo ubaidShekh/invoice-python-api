@@ -77,6 +77,7 @@ class DeliveryItemCreate(BaseModel):
 
 class BarcodeScan(BaseModel):
     barcode: str
+    customer_id: Optional[str] = None
 
 class DeliveryItemUpdate(BaseModel):
     invoice: Optional[str] = None
@@ -525,10 +526,14 @@ def get_pdf_invoice_details(filename: str):
         return {"filename": filename, "total_invoices": len(result), "invoices": result}
     except PyMongoError: raise HTTPException(status_code=500, detail="Failed to fetch PDF details")
 
+# ----- FIXED: customer_id support -----
 @app.get("/api/pdf-viewer-delivery-items")
-def get_pdf_viewer_delivery_items():
+def get_pdf_viewer_delivery_items(customer_id: Optional[str] = None):
     try:
-        items = list(pdf_viewer_delivery_collection.find().sort("created_at", -1))
+        query = {}
+        if customer_id:
+            query["customer_id"] = customer_id
+        items = list(pdf_viewer_delivery_collection.find(query).sort("created_at", -1))
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
 
         result = []
@@ -542,6 +547,7 @@ def get_pdf_viewer_delivery_items():
                 "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
                 "filename": item.get("filename", ""),
                 "customer_name": cust_name,
+                "customer_id": cust_id or "",
                 "date": item["delivered_at"].isoformat() if item.get("delivered_at") else "-"
             })
         return result
@@ -743,12 +749,15 @@ def update_delivery_report(item_id: str, data: DeliveryReportUpdate):
     if result.matched_count == 0: raise HTTPException(status_code=404, detail="Item not found")
     return {"message": "Report updated"}
 
+# ----- FIXED: customer_id support -----
 @app.get("/api/pdf-viewer-reports")
-def get_pdf_viewer_reports(status: str = "all"):
+def get_pdf_viewer_reports(status: str = "all", customer_id: Optional[str] = None):
     try:
         query = {}
         if status == "delivered": query["status"] = "Delivered"
         elif status == "undelivered": query["status"] = "Pending"
+        if customer_id:
+            query["customer_id"] = customer_id
         items_list = list(pdf_viewer_delivery_collection.find(query))
         customers = {str(c["_id"]): c.get("name", "Unknown") for c in customers_collection.find()}
 
@@ -773,6 +782,7 @@ def get_pdf_viewer_reports(status: str = "all"):
                 "barcode": item.get("barcode", ""), "status": item.get("status", "Pending"),
                 "deliveredAt": delivered_at_str,
                 "customer_name": cust_name,
+                "customer_id": cust_id or "",
                 "normal_rate": item.get("normal_rate", ""), "shak": item.get("shak", ""),
                 "tatriz": item.get("tatriz", ""), "amount": item.get("amount", "")
             })
@@ -861,7 +871,6 @@ def migrate_add_batch_ids():
             )
             migrated += 1
 
-        # invoices_collection ke liye bhi batch_id set karo (based on filename)
         for f in old_files:
             invoices_collection.update_many(
                 {"filename": f["filename"], "source": "pdf_viewer", "$or": [
@@ -872,7 +881,6 @@ def migrate_add_batch_ids():
                 {"$set": {"batch_id": legacy_batch, "batch_uploaded_at": f.get("uploaded_at") or now_utc()}}
             )
 
-        # Jo invoices_collection mein orphan hain (pdf_files mein filename nahi hai)
         invoices_collection.update_many(
             {"source": "pdf_viewer", "$or": [
                 {"batch_id": {"$exists": False}},
@@ -887,7 +895,51 @@ def migrate_add_batch_ids():
         raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 # =====================================================
-# Debug Endpoint
+# NEW: Fix Delivery Items customer_id
+# =====================================================
+@app.post("/api/admin/migrate-fix-delivery-customer-ids")
+def migrate_fix_delivery_customer_ids():
+    """Purane delivery items ke customer_id ko pdf_files se fix karta hai."""
+    try:
+        # pdf_files se filename -> customer_id mapping banao
+        filename_to_customer = {}
+        for f in pdf_files_collection.find({}, {"filename": 1, "customer_id": 1}):
+            if f.get("filename") and f.get("customer_id"):
+                filename_to_customer[f["filename"]] = f["customer_id"]
+
+        # invoices_collection se bhi mapping banao (backup)
+        for inv in invoices_collection.find({"source": "pdf_viewer"}, {"filename": 1, "customer_id": 1}):
+            filename = inv.get("filename")
+            cid = inv.get("customer_id")
+            if filename and cid and filename not in filename_to_customer:
+                filename_to_customer[filename] = cid
+
+        all_items = list(pdf_viewer_delivery_collection.find({}))
+        fixed = 0
+        still_missing = 0
+        for item in all_items:
+            needs_fix = not item.get("customer_id")
+            if needs_fix:
+                filename = item.get("filename")
+                if filename and filename in filename_to_customer:
+                    pdf_viewer_delivery_collection.update_one(
+                        {"_id": item["_id"]},
+                        {"$set": {"customer_id": filename_to_customer[filename]}}
+                    )
+                    fixed += 1
+                else:
+                    still_missing += 1
+        return {
+            "message": f"Fixed {fixed} delivery items, {still_missing} still missing customer_id",
+            "fixed": fixed,
+            "still_missing": still_missing,
+            "total_items": len(all_items),
+        }
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+# =====================================================
+# Debug Endpoints
 # =====================================================
 @app.get("/api/debug/pdf-files")
 def debug_pdf_files(customer_id: Optional[str] = None):
@@ -907,6 +959,25 @@ def debug_pdf_files(customer_id: Optional[str] = None):
                 "file_size": f.get("file_size"),
                 "has_binary": "file_data" in f,
             } for f in files]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/debug/delivery-items")
+def debug_delivery_items():
+    """Debug — delivery items ka customer_id status"""
+    try:
+        items = list(pdf_viewer_delivery_collection.find({}))
+        missing_cid = sum(1 for i in items if not i.get("customer_id"))
+        return {
+            "total": len(items),
+            "missing_customer_id": missing_cid,
+            "items": [{
+                "invoice": i.get("invoice"),
+                "filename": i.get("filename"),
+                "customer_id": i.get("customer_id", "MISSING"),
+                "status": i.get("status"),
+            } for i in items[:50]]
         }
     except Exception as e:
         return {"error": str(e)}
